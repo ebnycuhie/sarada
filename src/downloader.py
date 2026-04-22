@@ -1,11 +1,20 @@
 """
-downloader.py — Production-grade media downloader.
-Instagram → instaloader (mobile API, no cookie needed)
-TikTok / Facebook / X → gallery-dl (cookie-based)
+downloader.py — Production-grade media downloader for Sarada bot.
+
+Exports (required by handlers.py):
+    - Downloader     : main download class
+    - ErrorKind      : enum of failure categories
+    - MediaMode      : enum for photo / video / both
+
+Instagram  → instaloader  (mobile API — no cookies, no 429 on Railway)
+TikTok     → gallery-dl   (cookie optional)
+Facebook   → gallery-dl   (cookie recommended)
+X/Twitter  → gallery-dl   (cookie recommended)
 """
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -17,71 +26,113 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urlparse
 
 import instaloader
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Public enums  (imported by handlers.py)
+# ─────────────────────────────────────────────────────────────────────────────
 
-SUPPORTED_PLATFORMS = ("instagram", "tiktok", "facebook", "x")
+class MediaMode(enum.Enum):
+    """Which media types to download."""
+    PHOTOS = "photos"
+    VIDEOS = "videos"
+    BOTH   = "both"
 
-_INSTAGRAM_RE = re.compile(
+
+class ErrorKind(enum.Enum):
+    """Categorised failure reasons for the bot to give useful replies."""
+    UNSUPPORTED_URL    = "unsupported_url"
+    PRIVATE_CONTENT    = "private_content"
+    NOT_FOUND          = "not_found"
+    RATE_LIMITED       = "rate_limited"
+    NO_MEDIA           = "no_media"
+    FILE_TOO_LARGE     = "file_too_large"
+    TIMEOUT            = "timeout"
+    COOKIE_MISSING     = "cookie_missing"
+    COOKIE_EXPIRED     = "cookie_expired"
+    UNKNOWN            = "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal constants
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MAX_FILE_MB   = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+_GALLERY_DL    = shutil.which("gallery-dl") or "gallery-dl"
+
+_RE_INSTAGRAM  = re.compile(
     r"https?://(?:www\.)?instagram\.com/"
     r"(?:p|reel|reels|tv|stories)/([A-Za-z0-9_\-]+)"
 )
-_TIKTOK_RE = re.compile(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/")
-_FACEBOOK_RE = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/")
-_X_RE = re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com/")
+_RE_TIKTOK     = re.compile(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/")
+_RE_FACEBOOK   = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/")
+_RE_X          = re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com/")
 
-_MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
-_GALLERY_DL_BIN = shutil.which("gallery-dl") or "gallery-dl"
+_MEDIA_EXTS    = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}
+_PHOTO_EXTS    = {".jpg", ".jpeg", ".png", ".webp"}
+_VIDEO_EXTS    = {".mp4", ".mov", ".m4v"}
 
 
-# ──────────────────────────────────────────────
-# Data classes
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Result dataclass
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class DownloadResult:
-    success: bool
-    files: List[Path] = field(default_factory=list)
-    caption: Optional[str] = None
-    error: Optional[str] = None
-    platform: Optional[str] = None
+    success:    bool
+    files:      List[Path]        = field(default_factory=list)
+    caption:    Optional[str]     = None
+    error:      Optional[str]     = None
+    error_kind: Optional[ErrorKind] = None
+    platform:   Optional[str]    = None
 
 
-# ──────────────────────────────────────────────
-# Platform detection
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def detect_platform(url: str) -> Optional[str]:
-    if _INSTAGRAM_RE.search(url):
-        return "instagram"
-    if _TIKTOK_RE.search(url):
-        return "tiktok"
-    if _FACEBOOK_RE.search(url):
-        return "facebook"
-    if _X_RE.search(url):
-        return "x"
+def _detect_platform(url: str) -> Optional[str]:
+    if _RE_INSTAGRAM.search(url):  return "instagram"
+    if _RE_TIKTOK.search(url):     return "tiktok"
+    if _RE_FACEBOOK.search(url):   return "facebook"
+    if _RE_X.search(url):          return "x"
     return None
 
 
-# ──────────────────────────────────────────────
-# Instagram — instaloader (no cookie required)
-# ──────────────────────────────────────────────
+def _filter_by_mode(files: List[Path], mode: MediaMode) -> List[Path]:
+    if mode == MediaMode.PHOTOS:
+        return [f for f in files if f.suffix.lower() in _PHOTO_EXTS]
+    if mode == MediaMode.VIDEOS:
+        return [f for f in files if f.suffix.lower() in _VIDEO_EXTS]
+    return files  # BOTH
 
-class InstaloaderDownloader:
-    """
-    Downloads Instagram posts/reels/stories via instaloader.
-    Uses the public mobile API — no cookie, no 429 from datacenter IPs.
-    Optionally logs in with INSTAGRAM_USERNAME + INSTAGRAM_PASSWORD env vars
-    to access private content or avoid occasional rate limits.
-    """
 
+def _filter_by_size(files: List[Path]) -> List[Path]:
+    limit = _MAX_FILE_MB * 1024 * 1024
+    kept, dropped = [], 0
+    for f in files:
+        if f.stat().st_size <= limit:
+            kept.append(f)
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning("Dropped %d file(s) over %d MB", dropped, _MAX_FILE_MB)
+    return kept
+
+
+def _collect(directory: Path, exts: set) -> List[Path]:
+    return sorted(p for p in directory.rglob("*")
+                  if p.is_file() and p.suffix.lower() in exts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Instagram via instaloader
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _InstaLoader:
     def __init__(self) -> None:
         self._loader = instaloader.Instaloader(
             download_pictures=True,
@@ -96,9 +147,9 @@ class InstaloaderDownloader:
             request_timeout=30,
             quiet=True,
         )
-        self._login()
+        self._try_login()
 
-    def _login(self) -> None:
+    def _try_login(self) -> None:
         username = os.environ.get("INSTAGRAM_USERNAME", "").strip()
         password = os.environ.get("INSTAGRAM_PASSWORD", "").strip()
         if username and password:
@@ -106,290 +157,242 @@ class InstaloaderDownloader:
                 self._loader.login(username, password)
                 logger.info("instaloader: logged in as %s", username)
             except instaloader.exceptions.BadCredentialsException:
-                logger.warning("instaloader: bad credentials — running anonymously")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("instaloader: login failed (%s) — running anonymously", exc)
+                logger.warning("instaloader: bad credentials — anonymous mode")
+            except Exception as exc:
+                logger.warning("instaloader: login failed (%s) — anonymous mode", exc)
         else:
-            logger.info("instaloader: running anonymously (no INSTAGRAM_USERNAME set)")
+            logger.info("instaloader: anonymous mode (set INSTAGRAM_USERNAME to log in)")
 
-    # ------------------------------------------------------------------
-    def download(self, url: str, dest_dir: Path) -> DownloadResult:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        shortcode = self._extract_shortcode(url)
-        if not shortcode:
+    def download(self, url: str, dest: Path, mode: MediaMode) -> DownloadResult:
+        dest.mkdir(parents=True, exist_ok=True)
+        m = _RE_INSTAGRAM.search(url)
+        if not m:
             return DownloadResult(
                 success=False,
-                error="Could not extract Instagram shortcode from URL.",
+                error="Could not parse Instagram shortcode.",
+                error_kind=ErrorKind.UNSUPPORTED_URL,
                 platform="instagram",
             )
+        shortcode = m.group(1)
 
         try:
             post = instaloader.Post.from_shortcode(self._loader.context, shortcode)
-        except instaloader.exceptions.InstaloaderException as exc:
+        except instaloader.exceptions.LoginRequiredException:
             return DownloadResult(
                 success=False,
-                error=f"Instagram fetch failed: {exc}",
+                error="This Instagram post is private.",
+                error_kind=ErrorKind.PRIVATE_CONTENT,
                 platform="instagram",
             )
-        except Exception as exc:  # noqa: BLE001
+        except instaloader.exceptions.QueryReturnedNotFoundException:
             return DownloadResult(
                 success=False,
-                error=f"Unexpected error fetching post: {exc}",
+                error="Instagram post not found.",
+                error_kind=ErrorKind.NOT_FOUND,
+                platform="instagram",
+            )
+        except Exception as exc:
+            return DownloadResult(
+                success=False,
+                error=f"Failed to fetch Instagram post: {exc}",
+                error_kind=ErrorKind.UNKNOWN,
                 platform="instagram",
             )
 
-        caption = post.caption or ""
-
+        caption = (post.caption or "")[:1024]
+        original_cwd = Path.cwd()
         try:
-            # instaloader downloads into CWD; temporarily change to dest_dir
-            original_cwd = Path.cwd()
-            os.chdir(dest_dir)
-            self._loader.download_post(post, target=dest_dir / shortcode)
-            os.chdir(original_cwd)
+            os.chdir(dest)
+            self._loader.download_post(post, target=dest / shortcode)
         except instaloader.exceptions.InstaloaderException as exc:
+            return DownloadResult(
+                success=False,
+                error=f"Instagram download error: {exc}",
+                error_kind=ErrorKind.UNKNOWN,
+                platform="instagram",
+            )
+        except Exception as exc:
+            return DownloadResult(
+                success=False,
+                error=f"Unexpected error: {exc}",
+                error_kind=ErrorKind.UNKNOWN,
+                platform="instagram",
+            )
+        finally:
             os.chdir(original_cwd)
-            return DownloadResult(
-                success=False,
-                error=f"Instagram download failed: {exc}",
-                platform="instagram",
-            )
-        except Exception as exc:  # noqa: BLE001
-            try:
-                os.chdir(original_cwd)
-            except Exception:
-                pass
-            return DownloadResult(
-                success=False,
-                error=f"Unexpected download error: {exc}",
-                platform="instagram",
-            )
 
-        files = self._collect_media_files(dest_dir)
+        files = _filter_by_mode(_collect(dest, _MEDIA_EXTS), mode)
+        files = _filter_by_size(files)
+
         if not files:
             return DownloadResult(
                 success=False,
-                error="Download succeeded but no media files found.",
+                error="No media files found after download.",
+                error_kind=ErrorKind.NO_MEDIA,
                 platform="instagram",
             )
 
-        files = self._filter_by_size(files)
         return DownloadResult(
             success=True,
             files=files,
-            caption=caption[:1024] if caption else None,
+            caption=caption or None,
             platform="instagram",
         )
 
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _extract_shortcode(url: str) -> Optional[str]:
-        match = _INSTAGRAM_RE.search(url)
-        return match.group(1) if match else None
 
-    @staticmethod
-    def _collect_media_files(directory: Path) -> List[Path]:
-        extensions = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}
-        files: List[Path] = []
-        for path in sorted(directory.rglob("*")):
-            if path.is_file() and path.suffix.lower() in extensions:
-                files.append(path)
-        return files
+# ─────────────────────────────────────────────────────────────────────────────
+# TikTok / Facebook / X via gallery-dl
+# ─────────────────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _filter_by_size(files: List[Path]) -> List[Path]:
-        limit = _MAX_FILE_SIZE_MB * 1024 * 1024
-        filtered = [f for f in files if f.stat().st_size <= limit]
-        skipped = len(files) - len(filtered)
-        if skipped:
-            logger.warning("Skipped %d file(s) exceeding %d MB limit", skipped, _MAX_FILE_SIZE_MB)
-        return filtered
-
-
-# ──────────────────────────────────────────────
-# gallery-dl — TikTok / Facebook / X
-# ──────────────────────────────────────────────
-
-class GalleryDlDownloader:
-    """
-    Downloads TikTok, Facebook, and X media via gallery-dl.
-    Reads cookies from COOKIE_<PLATFORM> environment variables.
-    """
-
+class _GalleryDl:
     def __init__(self) -> None:
-        self._cookie_files: dict[str, Path] = {}
-        self._tmp_dir = Path(tempfile.mkdtemp(prefix="gdl_cookies_"))
+        self._tmp   = Path(tempfile.mkdtemp(prefix="sarada_gdl_"))
+        self._cookies: dict[str, Path] = {}
         self._load_cookies()
 
     def _load_cookies(self) -> None:
         for platform in ("tiktok", "facebook", "x"):
-            env_key = f"COOKIE_{platform.upper()}"
-            cookie_data = os.environ.get(env_key, "").strip()
-            if not cookie_data:
+            raw = os.environ.get(f"COOKIE_{platform.upper()}", "").strip()
+            if not raw:
                 logger.info("Cookie [%s]: ❌ missing", platform)
                 continue
-
-            cookie_path = self._tmp_dir / f"{platform}.txt"
-            cookie_path.write_text(cookie_data, encoding="utf-8")
-            size = len(cookie_data.encode())
-            self._cookie_files[platform] = cookie_path
-
+            path = self._tmp / f"{platform}.txt"
+            path.write_text(raw, encoding="utf-8")
+            size = len(raw.encode())
+            self._cookies[platform] = path
             if size < 2000:
-                logger.warning(
-                    "Cookie [%s]: ✅ %d bytes ⚠️  (too small — may cause 429)",
-                    platform, size,
-                )
+                logger.warning("Cookie [%s]: ✅ %d bytes ⚠️  (may cause 429)", platform, size)
             else:
                 logger.info("Cookie [%s]: ✅ %d bytes", platform, size)
 
-    # ------------------------------------------------------------------
-    def download(self, url: str, platform: str, dest_dir: Path) -> DownloadResult:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        config_path = self._write_config(platform, dest_dir)
+    def download(self, url: str, platform: str, dest: Path, mode: MediaMode) -> DownloadResult:
+        dest.mkdir(parents=True, exist_ok=True)
+        cfg_path = self._write_config(platform, dest)
 
-        cmd = [
-            _GALLERY_DL_BIN,
-            "--config", str(config_path),
-            "--no-mtime",
-            url,
-        ]
-
-        logger.info("gallery-dl cmd: %s %s", " ".join(cmd[:-1]), url)
+        cmd = [_GALLERY_DL, "--config", str(cfg_path), "--no-mtime", url]
+        logger.info("gallery-dl: %s", url)
 
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         except subprocess.TimeoutExpired:
             return DownloadResult(
                 success=False,
-                error="gallery-dl timed out after 120 seconds.",
+                error="Download timed out after 120 s.",
+                error_kind=ErrorKind.TIMEOUT,
                 platform=platform,
             )
         except FileNotFoundError:
             return DownloadResult(
                 success=False,
-                error="gallery-dl binary not found. Ensure it is installed.",
+                error="gallery-dl not installed.",
+                error_kind=ErrorKind.UNKNOWN,
                 platform=platform,
             )
 
-        if result.returncode not in (0, 1):
-            logger.error("gallery-dl stderr: %s", result.stderr[:500])
+        stderr = result.stderr or ""
+        if "HTTP Error 429" in stderr or "Too Many Requests" in stderr:
             return DownloadResult(
                 success=False,
-                error=f"gallery-dl exited {result.returncode}: {result.stderr[:300]}",
+                error="Rate limited (429). Try again later.",
+                error_kind=ErrorKind.RATE_LIMITED,
+                platform=platform,
+            )
+        if "HTTP Error 404" in stderr or "does not exist" in stderr.lower():
+            return DownloadResult(
+                success=False,
+                error="Content not found.",
+                error_kind=ErrorKind.NOT_FOUND,
+                platform=platform,
+            )
+        if "login" in stderr.lower() or "private" in stderr.lower():
+            return DownloadResult(
+                success=False,
+                error="Content is private or requires login.",
+                error_kind=ErrorKind.PRIVATE_CONTENT,
                 platform=platform,
             )
 
-        files = self._collect_media_files(dest_dir)
+        files = _filter_by_mode(_collect(dest, _MEDIA_EXTS), mode)
+        files = _filter_by_size(files)
+
         if not files:
-            hint = " (cookie may be expired or missing)" if platform != "tiktok" else ""
+            kind = ErrorKind.COOKIE_MISSING if platform not in self._cookies else ErrorKind.NO_MEDIA
             return DownloadResult(
                 success=False,
-                error=f"No media files downloaded{hint}.",
+                error=f"No media downloaded. {'Cookie missing.' if kind == ErrorKind.COOKIE_MISSING else ''}",
+                error_kind=kind,
                 platform=platform,
             )
 
-        files = self._filter_by_size(files)
-        return DownloadResult(
-            success=True,
-            files=files,
-            platform=platform,
-        )
+        return DownloadResult(success=True, files=files, platform=platform)
 
-    # ------------------------------------------------------------------
-    def _write_config(self, platform: str, dest_dir: Path) -> Path:
-        cookie_path = self._cookie_files.get(platform)
-
-        extractor_cfg: dict = {
-            "directory": [str(dest_dir)],
-            "filename": "{id}.{extension}",
+    def _write_config(self, platform: str, dest: Path) -> Path:
+        ext_cfg: dict = {
+            "directory": [str(dest)],
+            "filename":  "{id}.{extension}",
             "sleep-request": 3,
-            "retries": 3,
-            "timeout": 30,
+            "retries":   3,
+            "timeout":   30,
         }
-
-        if cookie_path:
-            extractor_cfg["cookies"] = str(cookie_path)
+        if platform in self._cookies:
+            ext_cfg["cookies"] = str(self._cookies[platform])
 
         proxy = os.environ.get("PROXY", os.environ.get("HTTP_PROXY", "")).strip()
         if proxy:
-            extractor_cfg["proxy"] = proxy
+            ext_cfg["proxy"] = proxy
 
-        config = {
-            "extractor": {
-                platform: extractor_cfg,
-            },
-            "downloader": {
-                "part": False,
-                "retries": 3,
-                "timeout": 60,
-            },
+        cfg = {
+            "extractor": {platform: ext_cfg},
+            "downloader": {"part": False, "retries": 3, "timeout": 60},
         }
-
-        cfg_path = self._tmp_dir / f"gdl_cfg_{platform}_{int(time.time())}.json"
-        cfg_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        return cfg_path
-
-    @staticmethod
-    def _collect_media_files(directory: Path) -> List[Path]:
-        extensions = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v", ".gif"}
-        return sorted(
-            p for p in directory.rglob("*")
-            if p.is_file() and p.suffix.lower() in extensions
-        )
-
-    @staticmethod
-    def _filter_by_size(files: List[Path]) -> List[Path]:
-        limit = _MAX_FILE_SIZE_MB * 1024 * 1024
-        filtered = [f for f in files if f.stat().st_size <= limit]
-        skipped = len(files) - len(filtered)
-        if skipped:
-            logger.warning("Skipped %d file(s) exceeding %d MB limit", skipped, _MAX_FILE_SIZE_MB)
-        return filtered
+        path = self._tmp / f"cfg_{platform}_{int(time.time())}.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        return path
 
 
-# ──────────────────────────────────────────────
-# Unified public API
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Public façade  (imported by handlers.py as `Downloader`)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class Downloader:
     """
     Single entry point for all platforms.
 
-    Usage:
         dl = Downloader()
-        result = dl.download("https://www.instagram.com/p/XYZ/", Path("/tmp/dl"))
+        result = dl.download(url, mode=MediaMode.BOTH)
     """
 
     def __init__(self) -> None:
-        self._insta = InstaloaderDownloader()
-        self._gdl = GalleryDlDownloader()
+        self._insta = _InstaLoader()
+        self._gdl   = _GalleryDl()
 
     # ------------------------------------------------------------------
-    def download(self, url: str, dest_dir: Optional[Path] = None) -> DownloadResult:
-        platform = detect_platform(url)
+    def download(
+        self,
+        url: str,
+        mode: MediaMode = MediaMode.BOTH,
+        dest_dir: Optional[Path] = None,
+    ) -> DownloadResult:
+        platform = _detect_platform(url)
         if platform is None:
             return DownloadResult(
                 success=False,
                 error="Unsupported URL. Supported: Instagram, TikTok, Facebook, X/Twitter.",
+                error_kind=ErrorKind.UNSUPPORTED_URL,
             )
 
         work_dir = dest_dir or Path(tempfile.mkdtemp(prefix="sarada_dl_"))
         work_dir.mkdir(parents=True, exist_ok=True)
 
         if platform == "instagram":
-            return self._insta.download(url, work_dir)
-
-        return self._gdl.download(url, platform, work_dir)
+            return self._insta.download(url, work_dir, mode)
+        return self._gdl.download(url, platform, work_dir, mode)
 
     # ------------------------------------------------------------------
     @staticmethod
     def is_supported(url: str) -> bool:
-        return detect_platform(url) is not None
+        return _detect_platform(url) is not None
 
     @staticmethod
-    def supported_platforms() -> tuple[str, ...]:
-        return SUPPORTED_PLATFORMS
+    def supported_platforms() -> tuple:
+        return ("instagram", "tiktok", "facebook", "x")
