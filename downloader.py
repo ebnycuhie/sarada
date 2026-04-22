@@ -1,487 +1,395 @@
 """
-downloader.py — gallery-dl subprocess wrapper.
-
-Key improvements:
-  • Writes /data/gallery-dl.conf with Instagram-specific settings that
-    dramatically reduce 429 rate-limiting:
-      - sleep-request: 8s for Instagram, 4s TikTok, 6s Facebook/X
-      - sleep-extractor: 5s between profile switches
-      - retries: 5 (up from 3)
-      - real Chrome User-Agent so Instagram doesn't flag the request
-      - cookies set at config level (gallery-dl picks them up automatically)
-  • Classifies gallery-dl stderr into typed ErrorKind so handlers.py
-    can give the user precise, actionable messages (429 vs login vs 404 etc.)
-  • stat() calls wrapped in try/except so a file vanishing mid-sort never crashes
-  • No blocking I/O on the asyncio event loop
+downloader.py — Production-grade media downloader.
+Instagram → instaloader (mobile API, no cookie needed)
+TikTok / Facebook / X → gallery-dl (cookie-based)
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import List, Optional
+from urllib.parse import urlparse
 
-if TYPE_CHECKING:
-    from config import Config, PlatformConfig
+import instaloader
 
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────
 
-# ── Enums / result types ───────────────────────────────────────────────────────
+SUPPORTED_PLATFORMS = ("instagram", "tiktok", "facebook", "x")
 
-class MediaMode(Enum):
-    PHOTOS = auto()
-    VIDEOS = auto()
-    BOTH   = auto()
+_INSTAGRAM_RE = re.compile(
+    r"https?://(?:www\.)?instagram\.com/"
+    r"(?:p|reel|reels|tv|stories)/([A-Za-z0-9_\-]+)"
+)
+_TIKTOK_RE = re.compile(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/")
+_FACEBOOK_RE = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/")
+_X_RE = re.compile(r"https?://(?:www\.)?(?:twitter|x)\.com/")
 
-    @classmethod
-    def from_str(cls, s: str) -> "MediaMode":
-        return {
-            "photos": cls.PHOTOS,
-            "videos": cls.VIDEOS,
-            "both":   cls.BOTH,
-        }.get(s.lower(), cls.BOTH)
-
-    def label(self) -> str:
-        return {
-            MediaMode.PHOTOS: "Photos only",
-            MediaMode.VIDEOS: "Videos only",
-            MediaMode.BOTH:   "Photos + Videos",
-        }[self]
+_MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "50"))
+_GALLERY_DL_BIN = shutil.which("gallery-dl") or "gallery-dl"
 
 
-class ErrorKind(Enum):
-    NONE         = "none"
-    RATE_LIMITED = "rate_limited"
-    LOGIN        = "login"
-    NOT_FOUND    = "not_found"
-    PRIVATE      = "private"
-    GALLERY_DL   = "gallery_dl"
-    NETWORK      = "network"
-    GENERIC      = "generic"
-
-
-def _classify_error(stderr: str, returncode: int) -> ErrorKind:
-    """Parse gallery-dl stderr + exit code into a typed ErrorKind."""
-    if returncode == 0:
-        return ErrorKind.NONE
-    if not stderr:
-        return ErrorKind.GENERIC
-    s = stderr.lower()
-    if "not found in path" in s:
-        return ErrorKind.GALLERY_DL
-    if "429" in s or "rate" in s or "too many requests" in s:
-        return ErrorKind.RATE_LIMITED
-    if "login" in s or "unauthorized" in s or "checkpoint" in s or "401" in s:
-        return ErrorKind.LOGIN
-    if "not found" in s or "404" in s or "does not exist" in s:
-        return ErrorKind.NOT_FOUND
-    if "private" in s or "restricted" in s:
-        return ErrorKind.PRIVATE
-    if "connection" in s or "timeout" in s or "network" in s or "ssl" in s:
-        return ErrorKind.NETWORK
-    return ErrorKind.GENERIC
-
+# ──────────────────────────────────────────────
+# Data classes
+# ──────────────────────────────────────────────
 
 @dataclass
-class SubfolderResult:
-    subfolder:      str
-    new_files:      list[Path]
-    archive_action: str
-    error:          str | None
-    error_kind:     ErrorKind = ErrorKind.NONE
+class DownloadResult:
+    success: bool
+    files: List[Path] = field(default_factory=list)
+    caption: Optional[str] = None
+    error: Optional[str] = None
+    platform: Optional[str] = None
 
 
-@dataclass
-class UserResult:
-    username:    str
-    platform:    str
-    results:     list[SubfolderResult] = field(default_factory=list)
-    skipped:     bool = False
-    skip_reason: str  = ""
+# ──────────────────────────────────────────────
+# Platform detection
+# ──────────────────────────────────────────────
 
-    @property
-    def total_new(self) -> int:
-        return sum(len(r.new_files) for r in self.results)
-
-    @property
-    def worst_error_kind(self) -> ErrorKind:
-        priority = [
-            ErrorKind.GALLERY_DL,
-            ErrorKind.RATE_LIMITED,
-            ErrorKind.LOGIN,
-            ErrorKind.PRIVATE,
-            ErrorKind.NOT_FOUND,
-            ErrorKind.NETWORK,
-            ErrorKind.GENERIC,
-            ErrorKind.NONE,
-        ]
-        for kind in priority:
-            if any(r.error_kind == kind for r in self.results):
-                return kind
-        return ErrorKind.NONE
+def detect_platform(url: str) -> Optional[str]:
+    if _INSTAGRAM_RE.search(url):
+        return "instagram"
+    if _TIKTOK_RE.search(url):
+        return "tiktok"
+    if _FACEBOOK_RE.search(url):
+        return "facebook"
+    if _X_RE.search(url):
+        return "x"
+    return None
 
 
-# ── Archive cleaner ────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Instagram — instaloader (no cookie required)
+# ──────────────────────────────────────────────
 
-class ArchiveCleaner:
+class InstaloaderDownloader:
     """
-    Mirrors CHECK_AND_CLEAN_ARCHIVE from the original .bat script.
-
-    Logic:
-      file_count == 0            → clear archive (folder is empty)
-      file_count < archive_count → clear archive (files were deleted, mismatch)
-      else                       → archive is valid, leave it alone
+    Downloads Instagram posts/reels/stories via instaloader.
+    Uses the public mobile API — no cookie, no 429 from datacenter IPs.
+    Optionally logs in with INSTAGRAM_USERNAME + INSTAGRAM_PASSWORD env vars
+    to access private content or avoid occasional rate limits.
     """
+
+    def __init__(self) -> None:
+        self._loader = instaloader.Instaloader(
+            download_pictures=True,
+            download_videos=True,
+            download_video_thumbnails=False,
+            download_geotags=False,
+            download_comments=False,
+            save_metadata=False,
+            compress_json=False,
+            post_metadata_txt_pattern="",
+            max_connection_attempts=3,
+            request_timeout=30,
+            quiet=True,
+        )
+        self._login()
+
+    def _login(self) -> None:
+        username = os.environ.get("INSTAGRAM_USERNAME", "").strip()
+        password = os.environ.get("INSTAGRAM_PASSWORD", "").strip()
+        if username and password:
+            try:
+                self._loader.login(username, password)
+                logger.info("instaloader: logged in as %s", username)
+            except instaloader.exceptions.BadCredentialsException:
+                logger.warning("instaloader: bad credentials — running anonymously")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("instaloader: login failed (%s) — running anonymously", exc)
+        else:
+            logger.info("instaloader: running anonymously (no INSTAGRAM_USERNAME set)")
+
+    # ------------------------------------------------------------------
+    def download(self, url: str, dest_dir: Path) -> DownloadResult:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shortcode = self._extract_shortcode(url)
+        if not shortcode:
+            return DownloadResult(
+                success=False,
+                error="Could not extract Instagram shortcode from URL.",
+                platform="instagram",
+            )
+
+        try:
+            post = instaloader.Post.from_shortcode(self._loader.context, shortcode)
+        except instaloader.exceptions.InstaloaderException as exc:
+            return DownloadResult(
+                success=False,
+                error=f"Instagram fetch failed: {exc}",
+                platform="instagram",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return DownloadResult(
+                success=False,
+                error=f"Unexpected error fetching post: {exc}",
+                platform="instagram",
+            )
+
+        caption = post.caption or ""
+
+        try:
+            # instaloader downloads into CWD; temporarily change to dest_dir
+            original_cwd = Path.cwd()
+            os.chdir(dest_dir)
+            self._loader.download_post(post, target=dest_dir / shortcode)
+            os.chdir(original_cwd)
+        except instaloader.exceptions.InstaloaderException as exc:
+            os.chdir(original_cwd)
+            return DownloadResult(
+                success=False,
+                error=f"Instagram download failed: {exc}",
+                platform="instagram",
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                os.chdir(original_cwd)
+            except Exception:
+                pass
+            return DownloadResult(
+                success=False,
+                error=f"Unexpected download error: {exc}",
+                platform="instagram",
+            )
+
+        files = self._collect_media_files(dest_dir)
+        if not files:
+            return DownloadResult(
+                success=False,
+                error="Download succeeded but no media files found.",
+                platform="instagram",
+            )
+
+        files = self._filter_by_size(files)
+        return DownloadResult(
+            success=True,
+            files=files,
+            caption=caption[:1024] if caption else None,
+            platform="instagram",
+        )
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_shortcode(url: str) -> Optional[str]:
+        match = _INSTAGRAM_RE.search(url)
+        return match.group(1) if match else None
 
     @staticmethod
-    def check_and_clean(dl_dir: Path, archive: Path) -> str:
+    def _collect_media_files(directory: Path) -> List[Path]:
+        extensions = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v"}
+        files: List[Path] = []
+        for path in sorted(directory.rglob("*")):
+            if path.is_file() and path.suffix.lower() in extensions:
+                files.append(path)
+        return files
+
+    @staticmethod
+    def _filter_by_size(files: List[Path]) -> List[Path]:
+        limit = _MAX_FILE_SIZE_MB * 1024 * 1024
+        filtered = [f for f in files if f.stat().st_size <= limit]
+        skipped = len(files) - len(filtered)
+        if skipped:
+            logger.warning("Skipped %d file(s) exceeding %d MB limit", skipped, _MAX_FILE_SIZE_MB)
+        return filtered
+
+
+# ──────────────────────────────────────────────
+# gallery-dl — TikTok / Facebook / X
+# ──────────────────────────────────────────────
+
+class GalleryDlDownloader:
+    """
+    Downloads TikTok, Facebook, and X media via gallery-dl.
+    Reads cookies from COOKIE_<PLATFORM> environment variables.
+    """
+
+    def __init__(self) -> None:
+        self._cookie_files: dict[str, Path] = {}
+        self._tmp_dir = Path(tempfile.mkdtemp(prefix="gdl_cookies_"))
+        self._load_cookies()
+
+    def _load_cookies(self) -> None:
+        for platform in ("tiktok", "facebook", "x"):
+            env_key = f"COOKIE_{platform.upper()}"
+            cookie_data = os.environ.get(env_key, "").strip()
+            if not cookie_data:
+                logger.info("Cookie [%s]: ❌ missing", platform)
+                continue
+
+            cookie_path = self._tmp_dir / f"{platform}.txt"
+            cookie_path.write_text(cookie_data, encoding="utf-8")
+            size = len(cookie_data.encode())
+            self._cookie_files[platform] = cookie_path
+
+            if size < 2000:
+                logger.warning(
+                    "Cookie [%s]: ✅ %d bytes ⚠️  (too small — may cause 429)",
+                    platform, size,
+                )
+            else:
+                logger.info("Cookie [%s]: ✅ %d bytes", platform, size)
+
+    # ------------------------------------------------------------------
+    def download(self, url: str, platform: str, dest_dir: Path) -> DownloadResult:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        config_path = self._write_config(platform, dest_dir)
+
+        cmd = [
+            _GALLERY_DL_BIN,
+            "--config", str(config_path),
+            "--no-mtime",
+            url,
+        ]
+
+        logger.info("gallery-dl cmd: %s %s", " ".join(cmd[:-1]), url)
+
         try:
-            files = [
-                f for f in dl_dir.iterdir()
-                if f.is_file() and f.name != "archive.txt"
-            ]
-        except OSError:
-            files = []
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return DownloadResult(
+                success=False,
+                error="gallery-dl timed out after 120 seconds.",
+                platform=platform,
+            )
+        except FileNotFoundError:
+            return DownloadResult(
+                success=False,
+                error="gallery-dl binary not found. Ensure it is installed.",
+                platform=platform,
+            )
 
-        file_count = len(files)
-        arch_count = 0
+        if result.returncode not in (0, 1):
+            logger.error("gallery-dl stderr: %s", result.stderr[:500])
+            return DownloadResult(
+                success=False,
+                error=f"gallery-dl exited {result.returncode}: {result.stderr[:300]}",
+                platform=platform,
+            )
 
-        if archive.exists():
-            try:
-                arch_count = sum(
-                    1 for _ in archive.open(encoding="utf-8", errors="replace")
-                )
-            except OSError:
-                arch_count = 0
+        files = self._collect_media_files(dest_dir)
+        if not files:
+            hint = " (cookie may be expired or missing)" if platform != "tiktok" else ""
+            return DownloadResult(
+                success=False,
+                error=f"No media files downloaded{hint}.",
+                platform=platform,
+            )
 
-        if file_count == 0:
-            if archive.exists():
-                try:
-                    archive.unlink()
-                    logger.debug("Archive cleared (folder empty): %s", archive)
-                except OSError as exc:
-                    logger.warning("Could not clear archive %s: %s", archive, exc)
-            return "cleared — folder empty"
+        files = self._filter_by_size(files)
+        return DownloadResult(
+            success=True,
+            files=files,
+            platform=platform,
+        )
 
-        if file_count < arch_count:
-            try:
-                archive.unlink()
-                logger.debug(
-                    "Archive cleared (mismatch %d files / %d entries): %s",
-                    file_count, arch_count, archive,
-                )
-            except OSError as exc:
-                logger.warning("Could not clear archive %s: %s", archive, exc)
-            return f"cleared — mismatch ({file_count} files, {arch_count} entries)"
+    # ------------------------------------------------------------------
+    def _write_config(self, platform: str, dest_dir: Path) -> Path:
+        cookie_path = self._cookie_files.get(platform)
 
-        return f"valid — {file_count} file(s), {arch_count} archive entries"
+        extractor_cfg: dict = {
+            "directory": [str(dest_dir)],
+            "filename": "{id}.{extension}",
+            "sleep-request": 3,
+            "retries": 3,
+            "timeout": 30,
+        }
 
+        if cookie_path:
+            extractor_cfg["cookies"] = str(cookie_path)
 
-# ── gallery-dl config writer ───────────────────────────────────────────────────
+        proxy = os.environ.get("PROXY", os.environ.get("HTTP_PROXY", "")).strip()
+        if proxy:
+            extractor_cfg["proxy"] = proxy
 
-class GalleryDLConfig:
-    """
-    Writes an optimised gallery-dl.conf to /data/gallery-dl.conf on first use.
-
-    Using a config file is significantly more powerful than CLI flags because it
-    lets us set Instagram-specific sleep timers, a real browser User-Agent, and
-    per-platform cookie paths — all of which reduce 429 rate-limiting.
-    """
-
-    _CONFIG_PATH = Path("/data/gallery-dl.conf")
-
-    # Chrome 124 on Windows 11 — common, unsuspicious User-Agent
-    _USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
-
-    @classmethod
-    def ensure_written(cls, cookies_dir: Path) -> Path:
-        """
-        Write the config file to disk. Always rewrites so that cookie paths
-        are kept current with the actual cookies_dir. Returns the config path.
-        """
-        cls._CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-        conf = {
+        config = {
             "extractor": {
-                "user-agent":        cls._USER_AGENT,
-                "retries":           5,
-                "timeout":           30,
-                "verify":            True,
-                "sleep-request":     3,
-                "sleep-extractor":   3,
-
-                "instagram": {
-                    "sleep-request":             8,
-                    "sleep-extractor":           5,
-                    "sleep-between-requests":    8,
-                    "retries":                   5,
-                    "videos":                    True,
-                    "reels":                     True,
-                    "posts":                     True,
-                    "tagged":                    False,
-                    "stories":                   False,
-                    "highlights":                False,
-                    "cookies": str(cookies_dir / "instagram.com_cookies.txt"),
-                },
-
-                "tiktok": {
-                    "sleep-request": 4,
-                    "retries":       4,
-                    "cookies": str(cookies_dir / "tiktok.com_cookies.txt"),
-                },
-
-                "facebook": {
-                    "sleep-request": 6,
-                    "retries":       4,
-                    "cookies": str(cookies_dir / "facebook.com_cookies.txt"),
-                },
-
-                "twitter": {
-                    "sleep-request": 5,
-                    "retries":       4,
-                    "cookies": str(cookies_dir / "x.com_cookies.txt"),
-                },
+                platform: extractor_cfg,
             },
-
             "downloader": {
-                "retries": 5,
+                "part": False,
+                "retries": 3,
                 "timeout": 60,
-                "rate":    None,
-            },
-
-            "output": {
-                "mode": "null",
             },
         }
 
-        try:
-            cls._CONFIG_PATH.write_text(
-                json.dumps(conf, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            logger.info("gallery-dl config written → %s", cls._CONFIG_PATH)
-        except OSError as exc:
-            logger.warning("Could not write gallery-dl config: %s", exc)
-
-        return cls._CONFIG_PATH
-
-
-# ── gallery-dl runner ──────────────────────────────────────────────────────────
-
-class GalleryDLRunner:
-    """Thin async wrapper around the gallery-dl CLI."""
-
-    _GALLERY_DL = "gallery-dl"
+        cfg_path = self._tmp_dir / f"gdl_cfg_{platform}_{int(time.time())}.json"
+        cfg_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        return cfg_path
 
     @staticmethod
-    async def run(
-        url:         str,
-        dl_dir:      Path,
-        ext_filter:  str,
-        archive:     Path,
-        cookies:     Path | None,
-        sleep_sec:   str,
-        config_path: Path | None,
-    ) -> tuple[int, str]:
-        """
-        Run gallery-dl and return (returncode, stderr_tail).
-        stdout is discarded; stderr is captured for error classification.
-        """
-        cmd: list[str] = [GalleryDLRunner._GALLERY_DL]
+    def _collect_media_files(directory: Path) -> List[Path]:
+        extensions = {".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".m4v", ".gif"}
+        return sorted(
+            p for p in directory.rglob("*")
+            if p.is_file() and p.suffix.lower() in extensions
+        )
 
-        if config_path and config_path.exists():
-            cmd += ["--config", str(config_path)]
-
-        cmd += [
-            "--directory",        str(dl_dir),
-            "--filter",           ext_filter,
-            "--download-archive", str(archive),
-            "--sleep-request",    sleep_sec,
-            "--sleep-extractor",  "3",
-            "--retries",          "5",
-            "--no-mtime",
-        ]
-
-        if cookies and cookies.exists():
-            cmd += ["--cookies", str(cookies)]
-
-        cmd.append(url)
-
-        logger.debug("gallery-dl cmd: %s", " ".join(cmd))
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            )
-            _, stderr_bytes = await proc.communicate()
-        except FileNotFoundError:
-            return -1, "gallery-dl not found in PATH — check Dockerfile"
-        except OSError as exc:
-            return -1, str(exc)
-
-        stderr = (stderr_bytes or b"").decode(errors="replace").strip()
-
-        if proc.returncode != 0:
-            logger.warning(
-                "gallery-dl rc=%d url=%s | %s",
-                proc.returncode, url, stderr[-400:],
-            )
-        else:
-            logger.info("gallery-dl OK: %s", url)
-
-        return proc.returncode, stderr[-600:] if stderr else ""
+    @staticmethod
+    def _filter_by_size(files: List[Path]) -> List[Path]:
+        limit = _MAX_FILE_SIZE_MB * 1024 * 1024
+        filtered = [f for f in files if f.stat().st_size <= limit]
+        skipped = len(files) - len(filtered)
+        if skipped:
+            logger.warning("Skipped %d file(s) exceeding %d MB limit", skipped, _MAX_FILE_SIZE_MB)
+        return filtered
 
 
-# ── Main download engine ───────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Unified public API
+# ──────────────────────────────────────────────
 
 class Downloader:
     """
-    Orchestrates per-user downloads across platforms.
-    Mirrors the original .bat DOWNLOAD_USER / DU_BOTH / DU_PHOTOS / DU_VIDEOS.
+    Single entry point for all platforms.
+
+    Usage:
+        dl = Downloader()
+        result = dl.download("https://www.instagram.com/p/XYZ/", Path("/tmp/dl"))
     """
 
-    def __init__(self, cfg: "Config") -> None:
-        self._cfg         = cfg
-        self._config_path = GalleryDLConfig.ensure_written(cfg.cookies_dir)
+    def __init__(self) -> None:
+        self._insta = InstaloaderDownloader()
+        self._gdl = GalleryDlDownloader()
 
-    def _snapshot(self, dl_dir: Path) -> set[Path]:
-        try:
-            return {
-                f for f in dl_dir.iterdir()
-                if f.is_file() and f.name != "archive.txt"
-            }
-        except OSError:
-            return set()
-
-    def _safe_mtime(self, p: Path) -> float:
-        try:
-            return p.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    async def _download_subfolder(
-        self,
-        subfolder:  str,
-        user_base:  Path,
-        ext_filter: str,
-        url:        str,
-        plat:       "PlatformConfig",
-        cookies:    Path | None,
-    ) -> SubfolderResult:
-        dl_dir  = user_base / subfolder
-        archive = dl_dir / "archive.txt"
-
-        try:
-            dl_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return SubfolderResult(
-                subfolder=subfolder,
-                new_files=[],
-                archive_action="error",
-                error=f"Could not create directory: {exc}",
-                error_kind=ErrorKind.GENERIC,
+    # ------------------------------------------------------------------
+    def download(self, url: str, dest_dir: Optional[Path] = None) -> DownloadResult:
+        platform = detect_platform(url)
+        if platform is None:
+            return DownloadResult(
+                success=False,
+                error="Unsupported URL. Supported: Instagram, TikTok, Facebook, X/Twitter.",
             )
 
-        archive_action = ArchiveCleaner.check_and_clean(dl_dir, archive)
-        before         = self._snapshot(dl_dir)
+        work_dir = dest_dir or Path(tempfile.mkdtemp(prefix="sarada_dl_"))
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        returncode, stderr = await GalleryDLRunner.run(
-            url=url,
-            dl_dir=dl_dir,
-            ext_filter=ext_filter,
-            archive=archive,
-            cookies=cookies,
-            sleep_sec=plat.sleep_sec,
-            config_path=self._config_path,
-        )
+        if platform == "instagram":
+            return self._insta.download(url, work_dir)
 
-        after      = self._snapshot(dl_dir)
-        new_files  = sorted(after - before, key=self._safe_mtime)
-        error_kind = _classify_error(stderr, returncode)
+        return self._gdl.download(url, platform, work_dir)
 
-        error: str | None = None
-        if returncode != 0 and stderr:
-            error = stderr
-
-        return SubfolderResult(
-            subfolder=subfolder,
-            new_files=new_files,
-            archive_action=archive_action,
-            error=error,
-            error_kind=error_kind,
-        )
-
-    async def download_user(
-        self,
-        url:  str,
-        plat: "PlatformConfig",
-        mode: MediaMode,
-    ) -> UserResult:
-        """Download photos and/or videos for one profile URL."""
-        username = self._extract_username(url, plat)
-        if not username:
-            return UserResult(
-                username=url,
-                platform=plat.name,
-                skipped=True,
-                skip_reason="Could not extract username from URL",
-            )
-
-        user_base   = self._cfg.base_dir / plat.folder / username
-        cookie_file = self._cfg.cookies_dir / plat.cookie_file
-        cookie_path = cookie_file if cookie_file.exists() else None
-
-        if cookie_path is None:
-            logger.warning(
-                "No cookie file for %s — gallery-dl.conf path will be tried.",
-                plat.name,
-            )
-
-        result = UserResult(username=username, platform=plat.name)
-        tasks: list[tuple[str, str]] = []
-
-        if mode in (MediaMode.PHOTOS, MediaMode.BOTH):
-            tasks.append(("Photos", self._cfg.photo_filter))
-        if mode in (MediaMode.VIDEOS, MediaMode.BOTH):
-            tasks.append(("Videos", self._cfg.video_filter))
-
-        for subfolder, ext_filter in tasks:
-            sub_result = await self._download_subfolder(
-                subfolder=subfolder,
-                user_base=user_base,
-                ext_filter=ext_filter,
-                url=url,
-                plat=plat,
-                cookies=cookie_path,
-            )
-            result.results.append(sub_result)
-
-        return result
+    # ------------------------------------------------------------------
+    @staticmethod
+    def is_supported(url: str) -> bool:
+        return detect_platform(url) is not None
 
     @staticmethod
-    def _extract_username(url: str, plat: "PlatformConfig") -> str:
-        """
-        Strip the platform URL prefix to get the bare username.
-        Mirrors the bat: set "user=!url:https://www.instagram.com/=!"
-        """
-        cleaned      = url.strip().rstrip("/")
-        prefix_lower = plat.url_prefix.lower()
-        if cleaned.lower().startswith(prefix_lower):
-            cleaned = cleaned[len(plat.url_prefix):]
-        cleaned = cleaned.lstrip("@").strip("/")
-        if cleaned.startswith("http"):
-            return ""
-        return cleaned
+    def supported_platforms() -> tuple[str, ...]:
+        return SUPPORTED_PLATFORMS
