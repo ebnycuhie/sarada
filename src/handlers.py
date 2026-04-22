@@ -3,11 +3,13 @@ handlers.py — All Telegram command, callback, and document handlers.
 
 Access model:
   • Private chat              → owner only
-  • Group (not whitelisted)   → owner sees "Allow This Group" button only
+  • Group (not whitelisted)   → owner sees "Activate This Group" button only
                                 non-owner → complete silence
   • Group (whitelisted)       → anyone: /start /run /list /status /cookies
-                                owner only: /add /remove /clear /allowgroup /denygroup
-  • Topics (forum groups)     → each username gets its own topic thread, reused on next run
+                                owner only: /add /remove /clear /cancel
+                                            /allowgroup /denygroup /groups
+  • Topics (forum groups)     → each username gets its own topic thread,
+                                reused on subsequent runs
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ PLATFORM_EMOJI: dict[str, str] = {
     "instagram": "📸",
     "tiktok":    "🎵",
     "facebook":  "💙",
-    "x":         "🐦",
+    "x":         "✖️",
 }
 
 TOPIC_COLORS: dict[str, int] = {
@@ -76,11 +78,11 @@ def _main_menu(is_owner: bool) -> InlineKeyboardMarkup:
     ]
     if is_owner:
         rows.append([
-            InlineKeyboardButton("✅ Allow This Group", callback_data="grp:allow_here"),
-            InlineKeyboardButton("🏘 My Groups",        callback_data="grp:list"),
+            InlineKeyboardButton("✅ Activate Group",  callback_data="grp:allow_here"),
+            InlineKeyboardButton("🏘️ My Groups",       callback_data="grp:list"),
         ])
         rows.append([
-            InlineKeyboardButton("🗑 Remove a Group", callback_data="grp:remove_prompt"),
+            InlineKeyboardButton("🗑️ Remove a Group", callback_data="grp:remove_prompt"),
         ])
     return InlineKeyboardMarkup(rows)
 
@@ -176,19 +178,22 @@ class BotHandlers:
                 await _send(
                     ctx, chat.id,
                     "⚙️ *Bot not activated in this group yet\\.*\n\n"
-                    "Tap below to activate it — members will then be able to use it here\\.",
+                    "Tap the button below to activate it\\. "
+                    "After activation, all members can use the bot here\\.",
                     reply_markup=_whitelist_prompt(),
                 )
                 return
 
         # ── Full menu ──────────────────────────────────────────────────────
+        total  = self._profiles.total_count()
         markup = _main_menu(is_owner)
         text   = (
-            "🎯 *SayFalse Media Bot*\n\n"
+            "🤖 *SayFalse Media Downloader*\n\n"
             "📥 *Quick Start:*\n"
-            "1\\. Send `instagram\\_profiles\\.txt` to import profiles\n"
-            "2\\. Send `instagram\\.com\\_cookies\\.txt` to add cookies \\(\\>2 KB\\)\n"
-            "3\\. Tap *📸 Photos*, *🎬 Videos*, or *📦 Both*\n\n"
+            "① Send `instagram\\_profiles\\.txt` to import profiles\n"
+            "② Send `instagram\\.com\\_cookies\\.txt` to add cookies \\(\\>2 KB\\)\n"
+            "③ Tap *📸 Photos*, *🎬 Videos*, or *📦 Both* to download\n\n"
+            f"📊 *Profiles queued:* {total}\n"
             "🌐 *Platforms:* Instagram · TikTok · Facebook · X\n\n"
             "⬇️ *Choose an action:*"
         )
@@ -234,6 +239,7 @@ class BotHandlers:
             await self._cb_cancel(update, ctx)
 
         elif data == "menu:main":
+            # Force re-check of whitelist in case group was just activated
             await self.cmd_start(update, ctx)
 
         elif data == "grp:allow_here":
@@ -254,11 +260,14 @@ class BotHandlers:
         elif data.startswith("grp:deny:"):
             if not is_owner:
                 return
-            gid = int(data.split(":")[2])
+            try:
+                gid = int(data.split(":")[2])
+            except (IndexError, ValueError):
+                return
             self._groups.deny(gid)
             await _send(
                 ctx, chat.id,
-                f"🗑 Group `{_esc(str(gid))}` removed\\.",
+                f"🗑️ Group `{_esc(str(gid))}` removed\\.",
                 reply_markup=_back_button(),
             )
 
@@ -281,7 +290,7 @@ class BotHandlers:
 
         total = self._profiles.total_count()
         if lines:
-            lines.append(f"\n_Total: {total} profile\\(s\\)_")
+            lines.append(f"\n_Total: {total} profile\\(s\\) queued_")
             text = "\n".join(lines)
         else:
             text = (
@@ -299,15 +308,25 @@ class BotHandlers:
         state      = (
             "🔄 *Running* — download in progress"
             if self._running else
-            "✅ *Idle* — ready"
+            "✅ *Idle* — ready to download"
         )
+        cookie_status = []
+        for name, size in cookies:
+            kb   = size / 1024
+            warn = " ⚠️" if size < _MIN_COOKIE_BYTES else " ✅"
+            cookie_status.append(f"  {warn} `{_esc(name)}` \\({kb:.1f} KB\\)")
+
         lines = [
-            "*📊 Bot Status*\n",
+            "📊 *Bot Status*\n",
             f"*State:* {state}",
             f"*Active platforms:* {plat_count}",
             f"*Profiles queued:* {total}",
             f"*Cookie files:* {len(cookies)}",
         ]
+        if cookie_status:
+            lines.append("")
+            lines.append("*🍪 Cookies:*")
+            lines.extend(cookie_status)
         await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
 
     async def _cb_cookies(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -318,34 +337,35 @@ class BotHandlers:
         if stored:
             for name, size in stored:
                 kb   = size / 1024
-                warn = " ⚠️ _too small — may be invalid_" if size < _MIN_COOKIE_BYTES else ""
+                warn = " ⚠️ _\\(too small — may fail\\)_" if size < _MIN_COOKIE_BYTES else ""
                 lines.append(f"✅ `{_esc(name)}` — {kb:.1f} KB{warn}")
         else:
-            lines.append("_No cookies uploaded yet\\._")
+            lines.append("_No cookies uploaded yet\\._\n")
 
         lines += [
             "",
             "*📤 How to export valid cookies:*",
-            "1\\. Install *Cookie\\-Editor* extension in Chrome/Firefox",
-            "2\\. Log in to Instagram \\(or TikTok etc\\.\\) in your browser",
-            "3\\. Open Cookie\\-Editor → *Export* → choose *Netscape* format",
+            "1\\. Install *Cookie\\-Editor* in Chrome/Firefox",
+            "2\\. Log into Instagram \\(or TikTok etc\\.\\) in browser",
+            "3\\. Open Cookie\\-Editor → *Export* → *Netscape* format",
             "4\\. Save as `instagram\\.com\\_cookies\\.txt`",
-            "5\\. Send the file here \\(should be \\>2 KB\\)",
+            "5\\. Send file here \\(must be \\>2 KB\\)",
             "",
-            "_A file smaller than 2 KB likely has missing session cookies_",
-            "_and gallery\\-dl will get a 429 or login error\\._",
+            "⚠️ _Files under 2 KB = missing session cookies_",
+            "_= gallery\\-dl will get 429 / login errors_",
         ]
         await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
 
     async def _cb_cancel(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
         if not self._running:
-            await _send(ctx, chat.id, "ℹ️ Nothing is running\\.", reply_markup=_back_button())
+            await _send(ctx, chat.id, "ℹ️ Nothing is currently running\\.", reply_markup=_back_button())
             return
         self._running = False
         await _send(
             ctx, chat.id,
-            "🛑 *Stop requested\\.* Current profile will finish, then the run stops\\.",
+            "🛑 *Stop requested\\.* "
+            "The current profile will finish, then the run stops\\.",
             reply_markup=_back_button(),
         )
 
@@ -354,21 +374,30 @@ class BotHandlers:
         if chat.type == ChatType.PRIVATE:
             await _send(
                 ctx, chat.id,
-                "ℹ️ Press *✅ Allow This Group* from *inside the group* you want to activate\\.",
+                "ℹ️ Tap *✅ Activate This Group* from *inside the group* you want to activate\\.",
                 reply_markup=_back_button(),
             )
             return
         added = self._groups.allow(chat.id)
         if added:
+            # Group is now whitelisted — show full menu immediately
+            is_owner = self._user_is_owner(update)
+            total    = self._profiles.total_count()
+            markup   = _main_menu(is_owner)
             msg = (
                 f"✅ *Group activated\\!*\n\n"
-                f"Group ID: `{_esc(str(chat.id))}`\n\n"
-                f"Members can now use the bot here\\.\n"
-                f"Send /start to see the full menu\\."
+                f"Group ID: `{_esc(str(chat.id))}`\n"
+                f"📊 Profiles queued: *{total}*\n\n"
+                f"Members can now use the bot here\\. "
+                f"Choose an action below:"
             )
+            await _send(ctx, chat.id, msg, reply_markup=markup)
         else:
-            msg = "ℹ️ This group is already activated\\."
-        await _send(ctx, chat.id, msg)
+            await _send(
+                ctx, chat.id,
+                "ℹ️ This group is already activated\\.",
+                reply_markup=_back_button(),
+            )
 
     async def _cb_groups_list(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         chat = update.effective_chat
@@ -377,12 +406,12 @@ class BotHandlers:
             await _send(
                 ctx, chat.id,
                 "📭 *No groups activated yet\\.*\n\n"
-                "Add the bot to a group, send /start there as the owner, "
-                "then tap *✅ Allow This Group*\\.",
+                "Add the bot to a group, send /start there as owner, "
+                "then tap *✅ Activate This Group*\\.",
                 reply_markup=_back_button(),
             )
             return
-        lines = ["*🏘 Activated Groups*\n"]
+        lines = [f"*🏘️ Activated Groups* \\({len(ids)}\\)\n"]
         for gid in ids:
             lines.append(f"• `{_esc(str(gid))}`")
         await _send(ctx, chat.id, "\n".join(lines), reply_markup=_back_button())
@@ -396,7 +425,7 @@ class BotHandlers:
             await _send(ctx, chat.id, "No groups to remove\\.", reply_markup=_back_button())
             return
         rows = [
-            [InlineKeyboardButton(f"🗑 {gid}", callback_data=f"grp:deny:{gid}")]
+            [InlineKeyboardButton(f"🗑️ {gid}", callback_data=f"grp:deny:{gid}")]
             for gid in ids
         ]
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="menu:main")])
@@ -416,7 +445,7 @@ class BotHandlers:
                 ctx, update.effective_chat.id,
                 "📝 *Usage:* `/add <platform> <url>`\n\n"
                 "Platforms: `instagram` `tiktok` `facebook` `x`\n\n"
-                "*Example:*\n`/add instagram https://www.instagram.com/username`",
+                "*Example:*\n`/add instagram https://www\\.instagram\\.com/username`",
             )
             return
         platform = ctx.args[0].lower().strip()
@@ -455,7 +484,7 @@ class BotHandlers:
         removed = self._profiles.remove(platform, url)
         await _send(
             ctx, update.effective_chat.id,
-            "🗑 Removed\\." if removed else "❌ URL not found\\.",
+            "🗑️ Removed\\." if removed else "❌ URL not found\\.",
         )
 
     # ── /list ─────────────────────────────────────────────────────────────────
@@ -481,7 +510,7 @@ class BotHandlers:
         em    = PLATFORM_EMOJI.get(platform, "📁")
         await _send(
             ctx, update.effective_chat.id,
-            f"🗑 Cleared {count} profile\\(s\\) from {em} *{_esc(platform)}*\\.",
+            f"🗑️ Cleared {count} profile\\(s\\) from {em} *{_esc(platform)}*\\.",
         )
 
     # ── /allowgroup ───────────────────────────────────────────────────────────
@@ -508,7 +537,7 @@ class BotHandlers:
         if chat.type == ChatType.PRIVATE:
             await _send(
                 ctx, chat.id,
-                "Use `/allowgroup <group\\_id>` or run this inside the group itself\\.",
+                "Use `/allowgroup <group\\_id>` or send this command from inside the group\\.",
             )
             return
 
@@ -533,7 +562,7 @@ class BotHandlers:
             removed = self._groups.deny(gid)
             await _send(
                 ctx, update.effective_chat.id,
-                f"🗑 Group `{_esc(str(gid))}` removed\\."
+                f"🗑️ Group `{_esc(str(gid))}` removed\\."
                 if removed else
                 f"❌ Group `{_esc(str(gid))}` not found\\.",
             )
@@ -589,7 +618,8 @@ class BotHandlers:
         if self._running:
             await _send(
                 ctx, chat.id,
-                "⚠️ A download is already running\\. Use *🛑 Stop Download* to cancel first\\.",
+                "⚠️ A download is already in progress\\.\n"
+                "Use *🛑 Stop Download* to cancel first\\.",
                 reply_markup=_back_button(),
             )
             return
@@ -599,7 +629,7 @@ class BotHandlers:
             await _send(
                 ctx, chat.id,
                 "📭 *No profiles queued\\.*\n\n"
-                "Send `instagram\\_profiles\\.txt` to the chat to import, or use `/add`\\.",
+                "Send `instagram\\_profiles\\.txt` to the chat, or use `/add`\\.",
                 reply_markup=_back_button(),
             )
             return
@@ -611,8 +641,7 @@ class BotHandlers:
             await _send(
                 ctx, chat.id,
                 f"🚀 *Download started*\n"
-                f"Mode: *{_esc(mode.label())}*\n"
-                f"Profiles: *{total}*\n\n"
+                f"Mode: *{_esc(mode.label())}*  \\|  Profiles: *{total}*\n\n"
                 f"_This may take a while — Instagram can be slow\\.\\.\\._",
             )
 
@@ -622,7 +651,7 @@ class BotHandlers:
                 if not urls:
                     continue
                 if not self._running:
-                    await _send(ctx, chat.id, "🛑 *Run cancelled\\.*")
+                    await _send(ctx, chat.id, "🛑 *Run cancelled by user\\.*")
                     return
 
                 plat_cfg = self._cfg.platforms[platform]
@@ -630,12 +659,12 @@ class BotHandlers:
 
                 await _send(
                     ctx, chat.id,
-                    f"📂 *{em} {_esc(plat_cfg.label)}* — {len(urls)} profile\\(s\\)",
+                    f"📂 *{em} {_esc(plat_cfg.label)}* — processing {len(urls)} profile\\(s\\)\\.\\.\\.",
                 )
 
                 for url in urls:
                     if not self._running:
-                        await _send(ctx, chat.id, "🛑 *Run cancelled\\.*")
+                        await _send(ctx, chat.id, "🛑 *Run cancelled by user\\.*")
                         return
 
                     username = Downloader._extract_username(url, plat_cfg) or url
@@ -682,9 +711,14 @@ class BotHandlers:
                                 f"\\[{_esc(sub.subfolder)}\\]\n\n"
                                 f"_Upload valid cookies and retry\\._"
                             )
+                        elif "gallery-dl not found" in err:
+                            msg = (
+                                f"🔥 *gallery\\-dl not installed\\!*\n\n"
+                                f"_Check your Dockerfile — `gallery-dl` must be in PATH\\._"
+                            )
                         else:
                             msg = (
-                                f"⚠️ `{_esc(username)}` \\[{_esc(sub.subfolder)}\\]: "
+                                f"⚠️ `{_esc(username)}` \\[{_esc(sub.subfolder)}\\]:\n"
                                 f"`{_esc(err[:250])}`"
                             )
                         await _send(ctx, chat.id, msg, thread_id=thread_id)
@@ -694,7 +728,7 @@ class BotHandlers:
 
                     await _send(
                         ctx, chat.id,
-                        f"✅ `{_esc(username)}` — *{new_count}* new file\\(s\\)",
+                        f"✅ `{_esc(username)}` — *{new_count}* new file\\(s\\) downloaded",
                         thread_id=thread_id,
                     )
 
@@ -702,12 +736,13 @@ class BotHandlers:
                     all_new: list[Path] = [
                         f for sub in result.results for f in sub.new_files
                     ]
-                    await self._deliver_files(ctx, chat.id, all_new, thread_id)
+                    if all_new:
+                        await self._deliver_files(ctx, chat.id, all_new, thread_id)
 
             await _send(
                 ctx, chat.id,
                 f"🏁 *All done\\!*\n\n"
-                f"📥 *{grand_total}* new file\\(s\\) downloaded total\\.",
+                f"📥 *{grand_total}* new file\\(s\\) downloaded in total\\.",
                 reply_markup=_back_button(),
             )
 
@@ -775,7 +810,7 @@ class BotHandlers:
                     await _send(
                         ctx, chat_id,
                         f"ℹ️ {remaining} more file\\(s\\) saved to disk "
-                        f"\\(cap of {cap} reached\\)\\.",
+                        f"\\(cap of {cap} per run reached\\)\\.",
                         thread_id=thread_id,
                     )
                 break
@@ -789,7 +824,7 @@ class BotHandlers:
                 await _send(
                     ctx, chat_id,
                     f"⚠️ `{_esc(path.name)}` — {size_mb:.1f} MB "
-                    f"\\(too large for Telegram, saved to disk\\)\\.",
+                    f"\\(too large for Telegram, saved to disk only\\)\\.",
                     thread_id=thread_id,
                 )
                 continue
@@ -865,8 +900,8 @@ class BotHandlers:
                         f"\n\n⚠️ *Warning:* Only {len(raw):,} bytes received\\. "
                         f"Valid cookies should be \\>2 KB\\. "
                         f"This file likely has missing session cookies — "
-                        f"Instagram will return *429* or refuse auth\\. "
-                        f"Re\\-export using Cookie\\-Editor \\(Netscape format\\)\\."
+                        f"Instagram will return *429* or refuse auth\\.\n"
+                        f"Re\\-export using *Cookie\\-Editor* \\(Netscape format\\)\\."
                     )
 
                 self._cookies.save(name, bytes(raw))
@@ -918,6 +953,8 @@ class BotHandlers:
             "*Expected filenames:*\n"
             "`instagram\\.com\\_cookies\\.txt`\n"
             "`tiktok\\.com\\_cookies\\.txt`\n"
+            "`facebook\\.com\\_cookies\\.txt`\n"
+            "`x\\.com\\_cookies\\.txt`\n"
             "`instagram\\_profiles\\.txt`\n"
             "`tiktok\\_profiles\\.txt` etc\\.",
         )
@@ -936,6 +973,6 @@ BOT_COMMANDS: list[BotCommand] = [
     BotCommand("cookies",     "List uploaded cookie files"),
     BotCommand("cancel",      "Stop an ongoing download"),
     BotCommand("allowgroup",  "Activate bot in this group"),
-    BotCommand("denygroup",   "Remove a group"),
+    BotCommand("denygroup",   "Remove a group from whitelist"),
     BotCommand("groups",      "List all activated groups"),
 ]

@@ -2,7 +2,7 @@
 bot.py — Application entrypoint.
 
 Bootstrap order:
-  1. Load config
+  1. Load config  (raises RuntimeError if BOT_TOKEN is missing)
   2. Setup rotating logging
   3. Create storage instances
   4. Configure auth module
@@ -150,17 +150,29 @@ def main() -> None:
 
     if cfg.owner_id == 0:
         logger.critical(
-            "OWNER_ID is not set! Anyone can control this bot. "
+            "OWNER_ID is not set — anyone can control this bot! "
             "Set the OWNER_ID environment variable immediately."
         )
 
     _ensure_dirs(cfg)
 
+    # Log cookie status on startup
+    for plat in cfg.platforms.values():
+        cookie_path = cfg.cookies_dir / plat.cookie_file
+        if cookie_path.exists():
+            size = cookie_path.stat().st_size
+            status = f"✅ {size:,} bytes"
+            if size < 2000:
+                status += " ⚠️  (too small — may cause 429)"
+        else:
+            status = "❌ missing"
+        logger.info("Cookie [%s]: %s", plat.name, status)
+
     app = _build_app(cfg)
     logger.info("Polling for updates…")
     app.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"],
+        allowed_updates=["message", "callback_query", "my_chat_member"],
     )
 
 

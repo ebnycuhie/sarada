@@ -1,13 +1,25 @@
 """
 config.py — Central configuration loaded from environment variables.
-All tunables live here. No magic strings elsewhere.
+
+Supports setting cookies directly via Railway environment variables:
+  COOKIE_INSTAGRAM  → base64-encoded instagram.com_cookies.txt content
+  COOKIE_TIKTOK     → base64-encoded tiktok.com_cookies.txt content
+  COOKIE_FACEBOOK   → base64-encoded facebook.com_cookies.txt content
+  COOKIE_X          → base64-encoded x.com_cookies.txt content
+
+These are decoded and written to /data/cookies/ on startup if the cookie
+file does not already exist. This allows cookie injection without file uploads.
 """
 
 from __future__ import annotations
 
+import base64
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _require(key: str) -> str:
@@ -51,9 +63,9 @@ class Config:
     log_file:      Path
 
     # ── Download limits ───────────────────────────────────────────────────────
-    max_send_files:   int   # max files pushed to Telegram per /run
-    max_file_size_mb: int   # Telegram bot upload ceiling (hard 50 MB)
-    max_concurrent:   int   # parallel gallery-dl workers
+    max_send_files:   int
+    max_file_size_mb: int
+    max_concurrent:   int
 
     # ── Platform registry ─────────────────────────────────────────────────────
     platforms: dict[str, PlatformConfig] = field(default_factory=dict)
@@ -76,6 +88,48 @@ class Config:
         quoted = ", ".join(f"'{e}'" for e in sorted(self.video_exts))
         return f"extension in ({quoted})"
 
+
+# ── Cookie env-var injection ───────────────────────────────────────────────────
+
+_COOKIE_ENV_MAP: dict[str, str] = {
+    "COOKIE_INSTAGRAM": "instagram.com_cookies.txt",
+    "COOKIE_TIKTOK":    "tiktok.com_cookies.txt",
+    "COOKIE_FACEBOOK":  "facebook.com_cookies.txt",
+    "COOKIE_X":         "x.com_cookies.txt",
+}
+
+
+def _inject_env_cookies(cookies_dir: Path) -> None:
+    """
+    If COOKIE_* env vars are set, decode them (base64 or plain text) and
+    write them to the cookies directory. Existing files are NOT overwritten
+    so that manually uploaded cookies take precedence.
+    """
+    cookies_dir.mkdir(parents=True, exist_ok=True)
+    for env_key, filename in _COOKIE_ENV_MAP.items():
+        value = os.environ.get(env_key, "").strip()
+        if not value:
+            continue
+        dest = cookies_dir / filename
+        if dest.exists():
+            logger.debug("Cookie env-var %s ignored — %s already exists.", env_key, filename)
+            continue
+        try:
+            # Try base64 decode first; fall back to raw text
+            try:
+                data = base64.b64decode(value)
+            except Exception:
+                data = value.encode()
+            dest.write_bytes(data)
+            logger.info(
+                "Cookie injected from env %s → %s (%d bytes)",
+                env_key, filename, len(data),
+            )
+        except OSError as exc:
+            logger.error("Failed to write cookie from %s: %s", env_key, exc)
+
+
+# ── load ───────────────────────────────────────────────────────────────────────
 
 def load() -> Config:
     """Build and return the singleton Config from the environment."""
@@ -119,7 +173,7 @@ def load() -> Config:
         ),
     }
 
-    return Config(
+    cfg = Config(
         bot_token=_require("BOT_TOKEN"),
         owner_id=_int_env("OWNER_ID", 0),
         base_dir=base_dir,
@@ -131,3 +185,8 @@ def load() -> Config:
         max_concurrent=_int_env("MAX_CONCURRENT", 1),
         platforms=platforms,
     )
+
+    # Inject cookies from env vars (Railway variables alternative to file upload)
+    _inject_env_cookies(cookies_dir)
+
+    return cfg
