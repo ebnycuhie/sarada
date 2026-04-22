@@ -3,7 +3,6 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
-# Install build deps only in this stage
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc \
     && rm -rf /var/lib/apt/lists/*
@@ -11,15 +10,13 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
-# System packages: ffmpeg (video processing), ca-certificates (HTTPS)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg \
-        ca-certificates \
+       ffmpeg \
+       ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -30,18 +27,23 @@ COPY --from=builder /install /usr/local
 RUN groupadd --gid 1001 botuser \
     && useradd --uid 1001 --gid botuser --shell /bin/sh --create-home botuser
 
-# App source
 WORKDIR /app
+
+# Copy application source
 COPY src/ .
 
-# Pre-create data dirs with correct ownership
-# (Railway Volume will be mounted at /data — these are fallbacks)
+# Copy gallery-dl config — fixes Instagram 403 by setting proper headers,
+# sleep intervals, and browser fingerprint.
+# /etc/gallery-dl.conf is the system-wide config path gallery-dl reads
+# automatically without any extra CLI flags.
+COPY gallery-dl.conf /etc/gallery-dl.conf
+
+# Pre-create data dirs
 RUN mkdir -p /data/downloads /data/cookies /data/logs \
     && chown -R botuser:botuser /data /app
 
 USER botuser
 
-# ── Environment defaults (override via Railway env vars) ──────────────────────
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DOWNLOAD_DIR=/data/downloads \
@@ -52,7 +54,6 @@ ENV PYTHONUNBUFFERED=1 \
     MAX_FILE_SIZE_MB=50 \
     MAX_CONCURRENT=1
 
-# Health: just verify the bot module imports cleanly
 HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
     CMD python -c "import bot, config, downloader, storage, auth" || exit 1
 
