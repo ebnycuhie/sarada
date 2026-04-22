@@ -1,16 +1,18 @@
 """
 downloader.py — gallery-dl subprocess wrapper.
 
-Fixes applied (v5):
-  BUG #1 — Removed "rate": None from gallery-dl.conf (JSON null crashes
-            gallery-dl's config parser, silently dropping all downloader settings).
-  BUG #3 — _extract_username now normalises URLs without 'www.' prefix,
-            mobile URLs, and trailing path segments (prevents full URL
-            being used as directory name).
-  BUG #6 — Cookie specification no longer duplicated between config file
-            and CLI --cookies flag. Config file handles per-platform cookies;
-            CLI flag is removed. This eliminates false-positive cookie errors
-            from gallery-dl when optional cookie files are absent.
+Key improvements:
+  • Writes /data/gallery-dl.conf with Instagram-specific settings that
+    dramatically reduce 429 rate-limiting:
+      - sleep-request: 8s for Instagram, 4s TikTok, 6s Facebook/X
+      - sleep-extractor: 5s between profile switches
+      - retries: 5 (up from 3)
+      - real Chrome User-Agent so Instagram doesn't flag the request
+      - cookies set at config level (gallery-dl picks them up automatically)
+  • Classifies gallery-dl stderr into typed ErrorKind so handlers.py
+    can give the user precise, actionable messages (429 vs login vs 404 etc.)
+  • stat() calls wrapped in try/except so a file vanishing mid-sort never crashes
+  • No blocking I/O on the asyncio event loop
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -188,16 +189,9 @@ class GalleryDLConfig:
     """
     Writes an optimised gallery-dl.conf to /data/gallery-dl.conf on first use.
 
-    FIX (BUG #1): Removed "rate": None from downloader section.
-    JSON null is not a valid value for gallery-dl's rate setting and causes
-    a TypeError in gallery-dl's config parser, silently removing all
-    downloader timeout/retry settings.
-
-    FIX (BUG #6): Cookie paths are NOT set in the config file. They are
-    passed exclusively via the --cookies CLI flag. Setting cookies in BOTH
-    places causes gallery-dl to emit spurious "cookie file not found" warnings
-    for platforms whose cookie files are absent, which pollutes stderr and
-    triggers false-positive LoginError/RateLimited classifications.
+    Using a config file is significantly more powerful than CLI flags because it
+    lets us set Instagram-specific sleep timers, a real browser User-Agent, and
+    per-platform cookie paths — all of which reduce 429 rate-limiting.
     """
 
     _CONFIG_PATH = Path("/data/gallery-dl.conf")
@@ -210,10 +204,10 @@ class GalleryDLConfig:
     )
 
     @classmethod
-    def ensure_written(cls, _cookies_dir: Path) -> Path:
+    def ensure_written(cls, cookies_dir: Path) -> Path:
         """
-        Write the config file to disk. Always rewrites so settings are current.
-        Returns the config path.
+        Write the config file to disk. Always rewrites so that cookie paths
+        are kept current with the actual cookies_dir. Returns the config path.
         """
         cls._CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -227,41 +221,42 @@ class GalleryDLConfig:
                 "sleep-extractor":   3,
 
                 "instagram": {
-                    "sleep-request":          8,
-                    "sleep-extractor":        5,
-                    "sleep-between-requests": 8,
-                    "retries":                5,
-                    "videos":                 True,
-                    "reels":                  True,
-                    "posts":                  True,
-                    "tagged":                 False,
-                    "stories":                False,
-                    "highlights":             False,
-                    # NOTE: no "cookies" key here — passed via CLI --cookies flag
-                    # to avoid false-positive errors when optional files are absent
+                    "sleep-request":             8,
+                    "sleep-extractor":           5,
+                    "sleep-between-requests":    8,
+                    "retries":                   5,
+                    "videos":                    True,
+                    "reels":                     True,
+                    "posts":                     True,
+                    "tagged":                    False,
+                    "stories":                   False,
+                    "highlights":                False,
+                    "cookies": str(cookies_dir / "instagram.com_cookies.txt"),
                 },
 
                 "tiktok": {
                     "sleep-request": 4,
                     "retries":       4,
+                    "cookies": str(cookies_dir / "tiktok.com_cookies.txt"),
                 },
 
                 "facebook": {
                     "sleep-request": 6,
                     "retries":       4,
+                    "cookies": str(cookies_dir / "facebook.com_cookies.txt"),
                 },
 
                 "twitter": {
                     "sleep-request": 5,
                     "retries":       4,
+                    "cookies": str(cookies_dir / "x.com_cookies.txt"),
                 },
             },
 
             "downloader": {
                 "retries": 5,
                 "timeout": 60,
-                # FIX (BUG #1): "rate": None removed — null crashes gallery-dl parser.
-                # Omitting the key entirely = unlimited rate (default behaviour).
+                "rate":    None,
             },
 
             "output": {
@@ -301,10 +296,6 @@ class GalleryDLRunner:
         """
         Run gallery-dl and return (returncode, stderr_tail).
         stdout is discarded; stderr is captured for error classification.
-
-        FIX (BUG #6): --cookies CLI flag is the SOLE source of cookie paths.
-        The config file no longer contains per-platform cookie= entries,
-        preventing duplicate specification and false-positive cookie errors.
         """
         cmd: list[str] = [GalleryDLRunner._GALLERY_DL]
 
@@ -455,8 +446,7 @@ class Downloader:
 
         if cookie_path is None:
             logger.warning(
-                "No cookie file for %s — download will proceed without auth "
-                "(public profiles only).",
+                "No cookie file for %s — gallery-dl.conf path will be tried.",
                 plat.name,
             )
 
@@ -484,50 +474,14 @@ class Downloader:
     @staticmethod
     def _extract_username(url: str, plat: "PlatformConfig") -> str:
         """
-        Extract the bare username from a profile URL.
-
-        FIX (BUG #3): Previous implementation only stripped the exact
-        url_prefix string. This failed for:
-          - URLs without 'www.' (e.g. https://instagram.com/user)
-          - Mobile URLs
-          - URLs with trailing path segments or query strings
-
-        New implementation: strip scheme → strip www. → strip platform
-        domain → take first non-empty path segment. Falls back to the
-        old prefix-strip approach if the robust method fails.
+        Strip the platform URL prefix to get the bare username.
+        Mirrors the bat: set "user=!url:https://www.instagram.com/=!"
         """
-        raw = url.strip().rstrip("/")
-        if not raw:
+        cleaned      = url.strip().rstrip("/")
+        prefix_lower = plat.url_prefix.lower()
+        if cleaned.lower().startswith(prefix_lower):
+            cleaned = cleaned[len(plat.url_prefix):]
+        cleaned = cleaned.lstrip("@").strip("/")
+        if cleaned.startswith("http"):
             return ""
-
-        # ── Robust extraction ─────────────────────────────────────────────
-        # Parse: remove scheme (http:// or https://)
-        no_scheme = re.sub(r"^https?://", "", raw, flags=re.IGNORECASE)
-
-        # Remove www. prefix
-        no_www = re.sub(r"^www\.", "", no_scheme, flags=re.IGNORECASE)
-
-        # Build a domain pattern from the platform's url_prefix
-        # e.g. "https://www.instagram.com/" → "instagram.com"
-        prefix_domain = re.sub(
-            r"^https?://(www\.)?", "", plat.url_prefix.rstrip("/"),
-            flags=re.IGNORECASE,
-        ).split("/")[0]  # e.g. "instagram.com"
-
-        # Strip the platform domain from the start
-        domain_pattern = re.escape(prefix_domain)
-        no_domain = re.sub(
-            rf"^{domain_pattern}/?", "", no_www, flags=re.IGNORECASE
-        )
-
-        # Strip leading @ (TikTok uses @username)
-        no_at = no_domain.lstrip("@")
-
-        # Take only the first path segment (ignore /posts/, /reels/, ?hl=en etc.)
-        username = no_at.split("/")[0].split("?")[0].split("#")[0].strip()
-
-        # Sanity: if still looks like a URL or is empty, reject
-        if not username or username.startswith("http"):
-            return ""
-
-        return username
+        return cleaned

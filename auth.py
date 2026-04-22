@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_OWNER_ID:    int                = 0
+_OWNER_ID:   int          = 0
 _GROUP_STORE: "GroupStore | None" = None
 
 

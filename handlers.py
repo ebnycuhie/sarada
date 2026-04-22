@@ -10,22 +10,10 @@ Access model:
                                             /allowgroup /denygroup /groups
   • Topics (forum groups)     → each username gets its own topic thread,
                                 reused on subsequent runs
-
-Fixes applied (v5):
-  BUG #4 — asyncio.Lock added to BotHandlers. self._running check+set is
-            now atomic, preventing two concurrent download sessions from
-            starting when two users tap a button simultaneously.
-  BUG #7 — 429 error message now uses plat_cfg.cookie_file (current
-            platform's cookie) instead of hardcoded instagram.com_cookies.txt.
-            TikTok/Facebook/X 429s now show the correct cookie filename.
-  BUG #8 — _deliver_files now handles telegram.error.RetryAfter (FloodWait)
-            by sleeping retry_after seconds before retrying. asyncio.sleep(0.5)
-            added between every send to stay within Telegram rate limits.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,7 +25,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType, ParseMode
-from telegram.error import BadRequest, RetryAfter, TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import ContextTypes
 
 import auth
@@ -68,12 +56,6 @@ TOPIC_COLORS: dict[str, int] = {
 
 # Warn if cookie file is below this size — valid cookies are usually 3–10 KB+
 _MIN_COOKIE_BYTES: int = 2_000
-
-# Delay between Telegram file sends to respect rate limits (~1 msg/sec per chat)
-_SEND_DELAY_SEC: float = 0.5
-
-# Maximum seconds to wait on a RetryAfter (FloodWait) before giving up
-_MAX_FLOOD_WAIT_SEC: int = 30
 
 
 # ── Markup builders ────────────────────────────────────────────────────────────
@@ -165,10 +147,6 @@ class BotHandlers:
         self._topics   = topics
         self._dl       = Downloader(cfg)
         self._running  = False
-        # FIX (BUG #4): asyncio.Lock makes the running check+set atomic.
-        # Without this, two simultaneous button taps both pass the
-        # "if self._running" guard before either sets it True.
-        self._run_lock = asyncio.Lock()
 
     # ── Access helpers ────────────────────────────────────────────────────────
 
@@ -637,33 +615,29 @@ class BotHandlers:
     ) -> None:
         chat = update.effective_chat
 
-        # FIX (BUG #4): Lock makes the running check+set atomic.
-        # Without the lock, two simultaneous taps pass the guard
-        # before either sets self._running = True.
-        async with self._run_lock:
-            if self._running:
-                await _send(
-                    ctx, chat.id,
-                    "⚠️ A download is already in progress\\.\n"
-                    "Use *🛑 Stop Download* to cancel first\\.",
-                    reply_markup=_back_button(),
-                )
-                return
-            self._running = True
+        if self._running:
+            await _send(
+                ctx, chat.id,
+                "⚠️ A download is already in progress\\.\n"
+                "Use *🛑 Stop Download* to cancel first\\.",
+                reply_markup=_back_button(),
+            )
+            return
+
+        total = self._profiles.total_count()
+        if total == 0:
+            await _send(
+                ctx, chat.id,
+                "📭 *No profiles queued\\.*\n\n"
+                "Send `instagram\\_profiles\\.txt` to the chat, or use `/add`\\.",
+                reply_markup=_back_button(),
+            )
+            return
+
+        is_forum      = getattr(chat, "is_forum", False)
+        self._running = True
 
         try:
-            total = self._profiles.total_count()
-            if total == 0:
-                await _send(
-                    ctx, chat.id,
-                    "📭 *No profiles queued\\.*\n\n"
-                    "Send `instagram\\_profiles\\.txt` to the chat, or use `/add`\\.",
-                    reply_markup=_back_button(),
-                )
-                return
-
-            is_forum = getattr(chat, "is_forum", False)
-
             await _send(
                 ctx, chat.id,
                 f"🚀 *Download started*\n"
@@ -724,30 +698,26 @@ class BotHandlers:
                             continue
                         sf = _esc(sub.subfolder)
                         un = _esc(username)
-
                         if sub.error_kind == ErrorKind.RATE_LIMITED:
-                            # FIX (BUG #7): Use the CURRENT platform's cookie file,
-                            # not the hardcoded instagram.com_cookies.txt.
-                            # TikTok/Facebook/X 429s now show the correct cookie.
-                            cookie_path = self._cfg.cookies_dir / plat_cfg.cookie_file
+                            cookie_path = self._cfg.cookies_dir / "instagram.com_cookies.txt"
                             if cookie_path.exists():
                                 kb = round(cookie_path.stat().st_size / 1024, 1)
                                 cookie_note = f"Current cookie: *{_esc(str(kb))} KB*"
                                 if kb < 2:
                                     cookie_note += " ⚠️ _\\(too small — definitely the cause\\)_"
                             else:
-                                cookie_note = f"Cookie file `{_esc(plat_cfg.cookie_file)}`: *missing*"
+                                cookie_note = "Cookie file: *missing*"
                             msg = (
                                 f"🚫 *Rate limited \\(429\\)* — `{un}` \\[{sf}\\]\n\n"
                                 f"{cookie_note}\n\n"
                                 f"*Fix:* Export fresh cookies \\(\\>5 KB\\) via "
                                 f"*Cookie\\-Editor* in Chrome → *Netscape* format → "
-                                f"send `{_esc(plat_cfg.cookie_file)}` here\\."
+                                f"send `instagram\\.com\\_cookies\\.txt` here\\."
                             )
                         elif sub.error_kind == ErrorKind.LOGIN:
                             msg = (
                                 f"🔐 *Login required* — `{un}` \\[{sf}\\]\n\n"
-                                f"Upload valid `{_esc(plat_cfg.cookie_file)}` and retry\\."
+                                f"Upload valid `instagram\\.com\\_cookies\\.txt` and retry\\."
                             )
                         elif sub.error_kind == ErrorKind.NOT_FOUND:
                             msg = (
@@ -850,21 +820,6 @@ class BotHandlers:
         files:     list[Path],
         thread_id: int | None,
     ) -> None:
-        """
-        Send downloaded files to Telegram.
-
-        FIX (BUG #8): Added rate-limiting and RetryAfter (FloodWait) handling.
-
-        Previous code sent files in a tight loop with no delay. Telegram
-        enforces ~1 msg/sec per chat. Rapid sends trigger RetryAfter errors.
-        The previous TelegramError catch fell back to send_document, which
-        also failed for the same FloodWait reason, silently dropping files.
-
-        Fixed by:
-          - asyncio.sleep(_SEND_DELAY_SEC) between every send
-          - Catching RetryAfter specifically and sleeping retry_after seconds
-          - Only falling back to send_document for non-FloodWait errors
-        """
         cap   = self._cfg.max_send_files
         limit = self._cfg.max_file_size_mb
         sent  = 0
@@ -896,37 +851,30 @@ class BotHandlers:
                 continue
 
             ext = path.suffix.lstrip(".").lower()
-
-            # Rate-limit delay before each send
-            await asyncio.sleep(_SEND_DELAY_SEC)
-
             try:
-                await self._send_one_file(ctx, chat_id, path, ext, thread_id)
+                with path.open("rb") as fh:
+                    if ext in self._cfg.video_exts:
+                        await ctx.bot.send_video(
+                            chat_id=chat_id,
+                            video=fh,
+                            message_thread_id=thread_id,
+                        )
+                    elif ext in self._cfg.photo_exts:
+                        await ctx.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=fh,
+                            message_thread_id=thread_id,
+                        )
+                    else:
+                        await ctx.bot.send_document(
+                            chat_id=chat_id,
+                            document=fh,
+                            message_thread_id=thread_id,
+                        )
                 sent += 1
-            except RetryAfter as exc:
-                # FIX (BUG #8): Honour Telegram's retry_after backoff.
-                # Previous code caught generic TelegramError and retried
-                # immediately as send_document — which also hit FloodWait.
-                wait = min(int(exc.retry_after) + 1, _MAX_FLOOD_WAIT_SEC)
-                logger.warning(
-                    "Telegram FloodWait %ds for chat=%d — sleeping",
-                    wait, chat_id,
-                )
-                await asyncio.sleep(wait)
-                # Single retry after waiting
+            except TelegramError:
+                # Fallback: send as generic document
                 try:
-                    await self._send_one_file(ctx, chat_id, path, ext, thread_id)
-                    sent += 1
-                except TelegramError as retry_exc:
-                    logger.warning(
-                        "Could not send %s after FloodWait retry: %s",
-                        path.name, retry_exc,
-                    )
-            except TelegramError as exc:
-                # Non-FloodWait error: try sending as generic document
-                logger.warning("send_typed failed for %s (%s) — trying as document", path.name, exc)
-                try:
-                    await asyncio.sleep(_SEND_DELAY_SEC)
                     with path.open("rb") as fh:
                         await ctx.bot.send_document(
                             chat_id=chat_id,
@@ -934,42 +882,13 @@ class BotHandlers:
                             message_thread_id=thread_id,
                         )
                     sent += 1
-                except TelegramError as fallback_exc:
-                    logger.warning("Could not send %s: %s", path.name, fallback_exc)
+                except TelegramError as exc:
+                    logger.warning("Could not send %s: %s", path.name, exc)
 
         logger.info(
             "Delivered %d/%d file(s) to chat=%d thread=%s",
             sent, len(files), chat_id, thread_id,
         )
-
-    async def _send_one_file(
-        self,
-        ctx:       ContextTypes.DEFAULT_TYPE,
-        chat_id:   int,
-        path:      Path,
-        ext:       str,
-        thread_id: int | None,
-    ) -> None:
-        """Send a single file using the appropriate Telegram method."""
-        with path.open("rb") as fh:
-            if ext in self._cfg.video_exts:
-                await ctx.bot.send_video(
-                    chat_id=chat_id,
-                    video=fh,
-                    message_thread_id=thread_id,
-                )
-            elif ext in self._cfg.photo_exts:
-                await ctx.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=fh,
-                    message_thread_id=thread_id,
-                )
-            else:
-                await ctx.bot.send_document(
-                    chat_id=chat_id,
-                    document=fh,
-                    message_thread_id=thread_id,
-                )
 
     # ── Document upload handler ───────────────────────────────────────────────
 

@@ -2,23 +2,18 @@
 config.py — Central configuration loaded from environment variables.
 
 Supports setting cookies directly via Railway environment variables:
-  COOKIE_INSTAGRAM  → raw Netscape cookie text OR base64-encoded content
-  COOKIE_TIKTOK     → raw Netscape cookie text OR base64-encoded content
-  COOKIE_FACEBOOK   → raw Netscape cookie text OR base64-encoded content
-  COOKIE_X          → raw Netscape cookie text OR base64-encoded content
+  COOKIE_INSTAGRAM  → base64-encoded instagram.com_cookies.txt content
+  COOKIE_TIKTOK     → base64-encoded tiktok.com_cookies.txt content
+  COOKIE_FACEBOOK   → base64-encoded facebook.com_cookies.txt content
+  COOKIE_X          → base64-encoded x.com_cookies.txt content
 
-Detection order:
-  1. If value starts with "# Netscape" → treat as raw text (most common)
-  2. Otherwise → try base64 decode, fall back to raw text
-
-These are written to /data/cookies/ on startup if the cookie file does not
-already exist. Manually uploaded cookies always take precedence.
+These are decoded and written to /data/cookies/ on startup if the cookie
+file does not already exist. This allows cookie injection without file uploads.
 """
 
 from __future__ import annotations
 
 import base64
-import binascii
 import logging
 import os
 from dataclasses import dataclass, field
@@ -103,49 +98,12 @@ _COOKIE_ENV_MAP: dict[str, str] = {
     "COOKIE_X":         "x.com_cookies.txt",
 }
 
-# Netscape cookie files always start with this header
-_NETSCAPE_HEADER = "# netscape"
-
-
-def _decode_cookie_value(value: str) -> bytes:
-    """
-    FIX (BUG #9): Previously always tried base64 first, which silently
-    corrupted raw Netscape cookie text (valid base64 alphabet).
-
-    Correct detection order:
-      1. If starts with '# Netscape' (case-insensitive) → raw text
-      2. Otherwise → attempt base64 decode
-      3. If base64 fails → raw text
-
-    This ensures pasting raw Netscape cookies directly works correctly.
-    """
-    stripped = value.strip()
-    if stripped.lower().startswith(_NETSCAPE_HEADER):
-        # Raw Netscape format — use as-is
-        return stripped.encode("utf-8")
-
-    # Try base64 decode (for users who base64-encoded their cookie file)
-    try:
-        decoded = base64.b64decode(stripped, validate=True)
-        # Sanity check: decoded bytes should look like a text cookie file
-        try:
-            decoded.decode("utf-8")
-            return decoded
-        except UnicodeDecodeError:
-            # Decoded to non-UTF-8 binary → wasn't actually base64 cookie data
-            pass
-    except (binascii.Error, ValueError):
-        pass
-
-    # Fallback: treat as raw text
-    return stripped.encode("utf-8")
-
 
 def _inject_env_cookies(cookies_dir: Path) -> None:
     """
-    If COOKIE_* env vars are set, decode them and write to the cookies
-    directory. Existing files are NOT overwritten so that manually uploaded
-    cookies take precedence.
+    If COOKIE_* env vars are set, decode them (base64 or plain text) and
+    write them to the cookies directory. Existing files are NOT overwritten
+    so that manually uploaded cookies take precedence.
     """
     cookies_dir.mkdir(parents=True, exist_ok=True)
     for env_key, filename in _COOKIE_ENV_MAP.items():
@@ -154,12 +112,14 @@ def _inject_env_cookies(cookies_dir: Path) -> None:
             continue
         dest = cookies_dir / filename
         if dest.exists():
-            logger.debug(
-                "Cookie env-var %s ignored — %s already exists.", env_key, filename
-            )
+            logger.debug("Cookie env-var %s ignored — %s already exists.", env_key, filename)
             continue
         try:
-            data = _decode_cookie_value(value)
+            # Try base64 decode first; fall back to raw text
+            try:
+                data = base64.b64decode(value)
+            except Exception:
+                data = value.encode()
             dest.write_bytes(data)
             logger.info(
                 "Cookie injected from env %s → %s (%d bytes)",
