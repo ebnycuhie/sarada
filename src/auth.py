@@ -34,10 +34,10 @@ def configure(owner_id: int, group_store: "GroupStore") -> None:
 def is_owner(user_id: int) -> bool:
     if _OWNER_ID == 0:
         logger.critical(
-            "OWNER_ID not set — treating all users as owner (INSECURE). "
+            "OWNER_ID not set; rejecting owner-only access. "
             "Set the OWNER_ID environment variable immediately."
         )
-        return True
+        return False
     return user_id == _OWNER_ID
 
 

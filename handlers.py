@@ -117,6 +117,33 @@ def _esc(text: str) -> str:
     return text
 
 
+def _split_message(text: str, limit: int = 4096) -> list[str]:
+    """Split long Telegram messages on line boundaries when possible."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        cut = remaining.rfind("\n", 0, limit + 1)
+        if cut <= 0:
+            cut = limit
+
+        chunk = remaining[:cut].rstrip("\n")
+        if chunk.endswith("\\") and cut > 1:
+            cut -= 1
+            chunk = remaining[:cut].rstrip("\n")
+
+        chunks.append(chunk or remaining[:limit])
+        remaining = remaining[cut:].lstrip("\n")
+
+    return chunks
+
+
 async def _send(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -126,13 +153,15 @@ async def _send(
 ) -> None:
     """Send a MarkdownV2 message, optionally into a forum topic thread."""
     try:
-        await ctx.bot.send_message(
-            chat_id=chat_id,
-            text=text[:4096],
-            parse_mode=ParseMode.MARKDOWN_V2,
-            message_thread_id=thread_id,
-            reply_markup=reply_markup,
-        )
+        chunks = _split_message(text)
+        for idx, chunk in enumerate(chunks):
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=chunk,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                message_thread_id=thread_id,
+                reply_markup=reply_markup if idx == len(chunks) - 1 else None,
+            )
     except TelegramError as exc:
         logger.error("send failed chat=%d thread=%s: %s", chat_id, thread_id, exc)
 
@@ -173,6 +202,7 @@ class BotHandlers:
         # Cancellation token: .set() signals the active run loop to abort
         # between profiles/URLs.  Replaced with a fresh Event on every new run.
         self._cancel_event: asyncio.Event = asyncio.Event()
+        self._run_start_lock = asyncio.Lock()
         # Strong reference to the running Task so we can await its teardown
         # before starting a replacement run.
         self._run_task: asyncio.Task | None = None
@@ -193,6 +223,13 @@ class BotHandlers:
     ) -> None:
         chat     = update.effective_chat
         is_owner = self._user_is_owner(update)
+
+        if chat is None:
+            return
+
+        if chat.type == ChatType.PRIVATE and not is_owner:
+            logger.warning("Private /start rejected for non-owner.")
+            return
 
         # ── Group access logic ─────────────────────────────────────────────
         if chat.type != ChatType.PRIVATE:
@@ -242,6 +279,13 @@ class BotHandlers:
         chat     = update.effective_chat
         data     = query.data or ""
         is_owner = self._user_is_owner(update)
+
+        if chat is None:
+            return
+
+        if chat.type == ChatType.PRIVATE and not is_owner:
+            logger.warning("Private callback rejected for non-owner.")
+            return
 
         # ── Group access guard ─────────────────────────────────────────────
         if chat.type != ChatType.PRIVATE:
@@ -557,9 +601,12 @@ class BotHandlers:
     # ── /allowgroup ───────────────────────────────────────────────────────────
 
     async def cmd_allowgroup(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self._ok(update, require_owner=True):
-            return
         chat = update.effective_chat
+        if chat is None:
+            return
+
+        if not self._user_is_owner(update):
+            return
 
         if ctx.args:
             try:
@@ -655,45 +702,46 @@ class BotHandlers:
         mode: MediaMode,
     ) -> None:
         chat = update.effective_chat
-
-        # ── Cancel any in-progress run and wait for it to finish cleanly ──────
-        if self._running and self._run_task and not self._run_task.done():
-            await _send(
-                ctx, chat.id,
-                "🔄 *Cancelling previous download…* Starting new one right after\\.",
-            )
-            # Signal the running loop to abort at its next checkpoint
-            self._cancel_event.set()
-            try:
-                # Give the old task up to 5 s to acknowledge the cancel signal
-                await asyncio.wait_for(
-                    asyncio.shield(self._run_task), timeout=5.0
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                pass  # Old task either finished or we give up waiting
-
-        total = self._profiles.total_count()
-        if total == 0:
-            await _send(
-                ctx, chat.id,
-                "📭 *No profiles queued\\.*\n\n"
-                "Send `instagram\\_profiles\\.txt` to the chat, or use `/add`\\.",
-                reply_markup=_back_button(),
-            )
+        if chat is None:
             return
 
-        # ── Fresh cancellation token for this run ─────────────────────────────
-        self._cancel_event = asyncio.Event()
-        self._running      = True
-        is_forum           = getattr(chat, "is_forum", False)
+        async with self._run_start_lock:
+            # Stop the previous run before creating a new cancellation token.
+            if self._running and self._run_task and not self._run_task.done():
+                await _send(
+                    ctx, chat.id,
+                    "🔄 *Stopping previous download\\.* New run will start after the current profile finishes\\.",
+                )
+                self._cancel_event.set()
+                try:
+                    await asyncio.shield(self._run_task)
+                except asyncio.CancelledError:
+                    pass
 
-        # Wrap the actual work in a Task so future requests can cancel it
-        self._run_task = asyncio.get_event_loop().create_task(
-            self._run_download(ctx, chat, mode, is_forum)
-        )
+            total = self._profiles.total_count()
+            if total == 0:
+                await _send(
+                    ctx, chat.id,
+                    "📭 *No profiles queued\\.*\n\n"
+                    "Send `instagram\\_profiles\\.txt` to the chat, or use `/add`\\.",
+                    reply_markup=_back_button(),
+                )
+                return
+
+            # Fresh cancellation token for this run.
+            cancel_event = asyncio.Event()
+            self._cancel_event = cancel_event
+            self._running      = True
+            is_forum           = getattr(chat, "is_forum", False)
+
+            run_task = asyncio.get_running_loop().create_task(
+                self._run_download(ctx, chat, mode, is_forum, cancel_event)
+            )
+            self._run_task = run_task
+
         # Await the task here so the handler waits for completion (or cancel)
         try:
-            await self._run_task
+            await run_task
         except asyncio.CancelledError:
             pass  # Cancelled by a subsequent request — already handled inside
 
@@ -705,12 +753,13 @@ class BotHandlers:
         chat,
         mode: MediaMode,
         is_forum: bool,
+        cancel_event: asyncio.Event,
     ) -> None:
         """
         Core download loop.  Runs as an asyncio Task so _execute_run can
         cancel it cleanly when a new request arrives.
 
-        Cancellation is cooperative: self._cancel_event is checked between
+        Cancellation is cooperative: cancel_event is checked between
         every profile and every URL.  The currently-running gallery-dl
         subprocess is allowed to finish its current file before stopping.
         """
@@ -730,7 +779,7 @@ class BotHandlers:
                     continue
 
                 # ── Cooperative cancellation checkpoint ────────────────────
-                if self._cancel_event.is_set():
+                if cancel_event.is_set():
                     await _send(ctx, chat.id, "🛑 *Run cancelled — new request received\\.*")
                     return
 
@@ -743,7 +792,7 @@ class BotHandlers:
 
                 for url in urls:
                     # ── Cooperative cancellation checkpoint ────────────────
-                    if self._cancel_event.is_set():
+                    if cancel_event.is_set():
                         await _send(ctx, chat.id, "🛑 *Run cancelled — new request received\\.*")
                         return
 
@@ -870,7 +919,8 @@ class BotHandlers:
                 reply_markup=_back_button(),
             )
         finally:
-            self._running = False
+            if self._run_task is asyncio.current_task():
+                self._running = False
 
     # ── Forum topic management ────────────────────────────────────────────────
 

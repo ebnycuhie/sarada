@@ -1,5 +1,9 @@
 """
-storage.py — Atomic persistence for profiles, cookies, groups, and topics.
+storage.py — Persistent storage for profiles, cookies, groups, and forum topics.
+
+All stores use atomic write patterns (write-then-rename) to prevent corruption
+on process crash mid-write.  Thread-safety is not required because the bot
+runs single-threaded via python-telegram-bot's async event loop.
 """
 
 from __future__ import annotations
@@ -16,19 +20,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 1
+# ── Atomic write helper ───────────────────────────────────────────────────────
 
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _atomic_write_json(path: Path, data: object) -> None:
-    """Write JSON atomically via temp-file + rename."""
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=parent, prefix=f".{path.stem}_", suffix=".json")
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write *data* to *path* atomically using a temp-file + rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp_")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
         os.replace(tmp, path)
     except Exception:
         try:
@@ -38,227 +38,235 @@ def _atomic_write_json(path: Path, data: object) -> None:
         raise
 
 
-def _safe_read_json(path: Path, default: object) -> object:
-    if not path.exists():
-        return default
+def _atomic_write_json(path: Path, obj: object) -> None:
+    data = json.dumps(obj, indent=2, ensure_ascii=False).encode("utf-8")
+    _atomic_write_bytes(path, data)
+
+
+def _load_json(path: Path, default: object) -> object:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.error("Failed to read %s: %s — using default.", path, exc)
+        return json.loads(path.read_text("utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
         return default
 
 
-# ── ProfileStore ───────────────────────────────────────────────────────────────
+# ── ProfileStore ──────────────────────────────────────────────────────────────
 
 class ProfileStore:
     """
-    Manages profiles.json with atomic writes.
+    Persists per-platform profile URL lists to a single JSON file.
 
-    Schema:
-        {"version": 1, "profiles": {"instagram": ["https://..."], ...}}
+    Schema: { "instagram": ["url1", ...], "tiktok": [...], ... }
     """
 
     def __init__(self, cfg: "Config") -> None:
-        self._path      = cfg.profiles_file
+        self._path = cfg.profiles_file
         self._platforms = list(cfg.platforms.keys())
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._data: dict[str, list[str]] = self._load()
 
-    def _load(self) -> dict:
-        raw = _safe_read_json(self._path, {})
-        if not isinstance(raw, dict) or "profiles" not in raw:
-            return self._empty()
-        for p in self._platforms:
-            raw["profiles"].setdefault(p, [])
-        return raw
+    # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _empty(self) -> dict:
-        return {"version": _SCHEMA_VERSION, "profiles": {p: [] for p in self._platforms}}
+    def _load(self) -> dict[str, list[str]]:
+        raw = _load_json(self._path, {})
+        if not isinstance(raw, dict):
+            raw = {}
+        result: dict[str, list[str]] = {}
+        for plat in self._platforms:
+            entries = raw.get(plat, [])
+            result[plat] = [str(u) for u in entries if isinstance(u, str)]
+        return result
 
-    def _save(self, data: dict) -> None:
-        _atomic_write_json(self._path, data)
+    def _save(self) -> None:
+        _atomic_write_json(self._path, self._data)
 
-    def all(self) -> dict[str, list[str]]:
-        return self._load()["profiles"]
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def get(self, platform: str) -> list[str]:
-        return self._load()["profiles"].get(platform, [])
+        """Return the URL list for *platform* (never None)."""
+        return list(self._data.get(platform, []))
+
+    def all(self) -> dict[str, list[str]]:
+        """Return a copy of all platform → URL lists."""
+        return {p: list(urls) for p, urls in self._data.items()}
+
+    def total_count(self) -> int:
+        return sum(len(v) for v in self._data.values())
 
     def add(self, platform: str, url: str) -> bool:
-        data   = self._load()
-        bucket = data["profiles"].setdefault(platform, [])
-        if url in bucket:
+        """Add *url* to *platform*. Returns True if added, False if duplicate."""
+        lst = self._data.setdefault(platform, [])
+        url = url.rstrip("/")
+        if url in lst:
             return False
-        bucket.append(url)
-        self._save(data)
+        lst.append(url)
+        self._save()
         logger.info("Profile added: %s → %s", url, platform)
         return True
 
     def add_bulk(self, platform: str, urls: list[str]) -> int:
-        data   = self._load()
-        bucket = data["profiles"].setdefault(platform, [])
-        added  = sum(1 for u in urls if u and u not in bucket and not bucket.append(u))
+        """Add multiple URLs; returns count of newly added entries."""
+        lst = self._data.setdefault(platform, [])
+        existing = set(lst)
+        added = 0
+        for url in urls:
+            url = url.rstrip("/")
+            if url not in existing:
+                lst.append(url)
+                existing.add(url)
+                added += 1
         if added:
-            self._save(data)
+            self._save()
+        logger.info("Bulk import: %d added to %s", added, platform)
         return added
 
     def remove(self, platform: str, url: str) -> bool:
-        data   = self._load()
-        bucket = data["profiles"].get(platform, [])
-        if url not in bucket:
-            return False
-        bucket.remove(url)
-        self._save(data)
-        return True
+        """Remove *url* from *platform*. Returns True if removed."""
+        url = url.rstrip("/")
+        lst = self._data.get(platform, [])
+        if url in lst:
+            lst.remove(url)
+            self._save()
+            logger.info("Profile removed: %s from %s", url, platform)
+            return True
+        return False
 
     def clear(self, platform: str) -> int:
-        data  = self._load()
-        count = len(data["profiles"].get(platform, []))
-        data["profiles"][platform] = []
-        self._save(data)
+        """Clear all URLs for *platform*. Returns count cleared."""
+        lst = self._data.get(platform, [])
+        count = len(lst)
+        self._data[platform] = []
+        self._save()
+        logger.info("Cleared %d profile(s) from %s", count, platform)
         return count
 
-    def total_count(self) -> int:
-        return sum(len(v) for v in self.all().values())
 
+# ── CookieStore ───────────────────────────────────────────────────────────────
 
-# ── CookieStore ────────────────────────────────────────────────────────────────
+# Valid cookie filenames the bot accepts (maps to platforms)
+_VALID_COOKIE_NAMES: frozenset[str] = frozenset({
+    "instagram.com_cookies.txt",
+    "tiktok.com_cookies.txt",
+    "facebook.com_cookies.txt",
+    "x.com_cookies.txt",
+})
+
 
 class CookieStore:
-    """Manages uploaded Netscape-format cookie files."""
-
-    VALID_NAMES: frozenset[str] = frozenset({
-        "instagram.com_cookies.txt",
-        "tiktok.com_cookies.txt",
-        "facebook.com_cookies.txt",
-        "x.com_cookies.txt",
-    })
+    """Manages per-platform Netscape cookie files in *cookies_dir*."""
 
     def __init__(self, cfg: "Config") -> None:
         self._dir = cfg.cookies_dir
         self._dir.mkdir(parents=True, exist_ok=True)
 
-    def is_valid_name(self, name: str) -> bool:
-        return name in self.VALID_NAMES
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    def save(self, name: str, data: bytes) -> Path:
+    @staticmethod
+    def is_valid_name(name: str) -> bool:
+        return name in _VALID_COOKIE_NAMES
+
+    def save(self, name: str, data: bytes) -> None:
+        """Write *data* as cookie file *name*, atomically."""
         dest = self._dir / name
-        fd, tmp = tempfile.mkstemp(dir=self._dir, prefix=".cookie_")
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp, dest)
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _atomic_write_bytes(dest, data)
         logger.info("Cookie saved: %s (%d bytes)", name, len(data))
-        return dest
 
-    def path_for(self, cookie_file: str) -> Path:
-        return self._dir / cookie_file
-
-    def exists(self, cookie_file: str) -> bool:
-        return (self._dir / cookie_file).exists()
+    def path_for(self, filename: str) -> Path:
+        return self._dir / filename
 
     def list_all(self) -> list[tuple[str, int]]:
-        """Returns [(name, size_bytes), ...] sorted by name."""
-        result = []
-        for f in sorted(self._dir.iterdir()):
-            if f.is_file() and f.suffix == ".txt":
-                try:
-                    result.append((f.name, f.stat().st_size))
-                except OSError:
-                    pass
-        return result
+        """Return list of (filename, size_bytes) for all present cookie files."""
+        result: list[tuple[str, int]] = []
+        for name in _VALID_COOKIE_NAMES:
+            p = self._dir / name
+            if p.exists():
+                result.append((name, p.stat().st_size))
+        return sorted(result)
 
 
-# ── GroupStore ─────────────────────────────────────────────────────────────────
+# ── GroupStore ────────────────────────────────────────────────────────────────
 
 class GroupStore:
     """
-    Manages the whitelist of Telegram group/supergroup IDs
-    that the bot is allowed to operate in.
+    Persists the set of whitelisted Telegram group/supergroup chat IDs.
+
+    Schema: { "allowed": [chat_id, ...] }
     """
 
     def __init__(self, data_dir: Path) -> None:
         self._path = data_dir / "groups.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._allowed: set[int] = self._load()
 
-    def _load(self) -> list[int]:
-        raw = _safe_read_json(self._path, [])
-        if not isinstance(raw, list):
-            return []
-        try:
-            return [int(x) for x in raw]
-        except (ValueError, TypeError):
-            return []
+    def _load(self) -> set[int]:
+        raw = _load_json(self._path, {"allowed": []})
+        if not isinstance(raw, dict):
+            return set()
+        entries = raw.get("allowed", [])
+        return {int(x) for x in entries if isinstance(x, (int, str))}
 
-    def _save(self, ids: list[int]) -> None:
-        _atomic_write_json(self._path, ids)
+    def _save(self) -> None:
+        _atomic_write_json(self._path, {"allowed": sorted(self._allowed)})
 
-    def allow(self, group_id: int) -> bool:
-        """Add group to whitelist. Returns True if newly added."""
-        ids = self._load()
-        if group_id in ids:
-            return False
-        ids.append(group_id)
-        self._save(ids)
-        logger.info("Group allowed: %d", group_id)
-        return True
-
-    def deny(self, group_id: int) -> bool:
-        """Remove group from whitelist. Returns True if was present."""
-        ids = self._load()
-        if group_id not in ids:
-            return False
-        ids.remove(group_id)
-        self._save(ids)
-        logger.info("Group removed: %d", group_id)
-        return True
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def is_allowed(self, chat_id: int) -> bool:
-        return chat_id in self._load()
+        return chat_id in self._allowed
+
+    def allow(self, chat_id: int) -> bool:
+        """Whitelist *chat_id*. Returns True if newly added."""
+        if chat_id in self._allowed:
+            return False
+        self._allowed.add(chat_id)
+        self._save()
+        logger.info("Group whitelisted: %d", chat_id)
+        return True
+
+    def deny(self, chat_id: int) -> bool:
+        """Remove *chat_id* from whitelist. Returns True if removed."""
+        if chat_id not in self._allowed:
+            return False
+        self._allowed.discard(chat_id)
+        self._save()
+        logger.info("Group removed: %d", chat_id)
+        return True
 
     def list_all(self) -> list[int]:
-        return self._load()
+        return sorted(self._allowed)
 
 
 # ── TopicStore ────────────────────────────────────────────────────────────────
 
 class TopicStore:
     """
-    Stores Telegram forum topic thread IDs per group + platform + username.
+    Persists forum topic thread IDs so repeated runs reuse the same topic.
 
-    Schema:
-        {"<group_id>": {"<platform>:<username>": <thread_id>, ...}, ...}
+    Schema: { "chat_id:platform:username": thread_id, ... }
     """
 
     def __init__(self, data_dir: Path) -> None:
         self._path = data_dir / "topics.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._data: dict[str, int] = self._load()
 
-    def _load(self) -> dict[str, dict[str, int]]:
-        raw = _safe_read_json(self._path, {})
-        return raw if isinstance(raw, dict) else {}
+    def _load(self) -> dict[str, int]:
+        raw = _load_json(self._path, {})
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): int(v) for k, v in raw.items() if isinstance(v, (int, float))}
 
-    def _save(self, data: dict) -> None:
-        _atomic_write_json(self._path, data)
+    def _save(self) -> None:
+        _atomic_write_json(self._path, self._data)
 
     @staticmethod
-    def _key(platform: str, username: str) -> str:
-        return f"{platform}:{username}"
+    def _key(chat_id: int, platform: str, username: str) -> str:
+        return f"{chat_id}:{platform}:{username}"
 
-    def get(self, group_id: int, platform: str, username: str) -> int | None:
-        data  = self._load()
-        group = data.get(str(group_id), {})
-        val   = group.get(self._key(platform, username))
-        return int(val) if val is not None else None
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    def set(self, group_id: int, platform: str, username: str, thread_id: int) -> None:
-        data = self._load()
-        gkey = str(group_id)
-        data.setdefault(gkey, {})[self._key(platform, username)] = thread_id
-        self._save(data)
-        logger.debug("Topic stored: group=%d %s:%s → thread=%d", group_id, platform, username, thread_id)
+    def get(self, chat_id: int, platform: str, username: str) -> int | None:
+        return self._data.get(self._key(chat_id, platform, username))
+
+    def set(self, chat_id: int, platform: str, username: str, thread_id: int) -> None:
+        self._data[self._key(chat_id, platform, username)] = thread_id
+        self._save()

@@ -218,6 +218,10 @@ def load() -> Config:
     cookies_dir = _path_env("COOKIES_DIR",  "/data/cookies")
     data_dir    = _path_env("DATA_DIR",     "/data")
     log_dir     = _path_env("LOG_DIR",      "/data/logs")
+    owner_id    = _int_env("OWNER_ID", 0)
+
+    if owner_id <= 0:
+        raise RuntimeError("Required environment variable 'OWNER_ID' must be a non-zero integer.")
 
     platforms: dict[str, PlatformConfig] = {
         "instagram": PlatformConfig(
@@ -256,7 +260,7 @@ def load() -> Config:
 
     cfg = Config(
         bot_token=_require("BOT_TOKEN"),
-        owner_id=_int_env("OWNER_ID", 0),
+        owner_id=owner_id,
         base_dir=base_dir,
         cookies_dir=cookies_dir,
         profiles_file=data_dir / "profiles.json",

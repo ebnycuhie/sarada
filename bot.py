@@ -2,25 +2,27 @@
 bot.py — Application entrypoint.
 
 Bootstrap order:
-  1. Load config  (raises RuntimeError if BOT_TOKEN is missing)
-  2. Setup rotating logging
-  3. Create storage instances
-  4. Configure auth module
-  5. Register all handlers + bot commands menu
-  6. Start polling
+1. Load config (raises RuntimeError if BOT_TOKEN is missing)
+2. Setup rotating logging
+3. Create storage instances
+4. Configure auth module
+5. Register all handlers + bot commands menu
+6. Start polling
 """
-
 from __future__ import annotations
 
 import logging
 import logging.handlers
+import os
 import sys
 from pathlib import Path
 
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
 )
@@ -31,15 +33,16 @@ from config import Config
 from handlers import BOT_COMMANDS, BotHandlers
 from storage import CookieStore, GroupStore, ProfileStore, TopicStore
 
-
 # ── Logging ────────────────────────────────────────────────────────────────────
 
 def _setup_logging(log_file: Path) -> None:
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    fmt  = logging.Formatter(
+
+    fmt = logging.Formatter(
         "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
@@ -58,6 +61,37 @@ def _setup_logging(log_file: Path) -> None:
 
 
 logger = logging.getLogger(__name__)
+
+# ── Error handler ──────────────────────────────────────────────────────────────
+
+async def _error_handler(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Global PTB error handler.
+
+    Conflict means a second instance is polling the same token.
+    Exit immediately with code 1 so Railway restarts this container
+    after the overlap window has closed.  All other errors are logged
+    and swallowed so the bot keeps running.
+    """
+    if isinstance(context.error, Conflict):
+        logger.critical(
+            "Conflict: another bot instance is already running. "
+            "Exiting so Railway can restart cleanly. "
+            "Error: %s",
+            context.error,
+        )
+        # os._exit bypasses atexit / finalizers — guarantees immediate death
+        # even if the asyncio event loop refuses to cooperate.
+        os._exit(1)
+
+    logger.error(
+        "Unhandled error processing update %s: %s",
+        update,
+        context.error,
+        exc_info=context.error,
+    )
 
 
 # ── Startup hook ───────────────────────────────────────────────────────────────
@@ -85,9 +119,9 @@ def _ensure_dirs(cfg: Config) -> None:
 
 def _build_app(cfg: Config) -> Application:
     profiles = ProfileStore(cfg)
-    cookies  = CookieStore(cfg)
-    groups   = GroupStore(cfg.profiles_file.parent)
-    topics   = TopicStore(cfg.profiles_file.parent)
+    cookies = CookieStore(cfg)
+    groups = GroupStore(cfg.profiles_file.parent)
+    topics = TopicStore(cfg.profiles_file.parent)
 
     auth.configure(cfg.owner_id, groups)
 
@@ -106,20 +140,23 @@ def _build_app(cfg: Config) -> Application:
         .build()
     )
 
+    # ── Global error handler (handles Conflict + all other errors) ─────────
+    app.add_error_handler(_error_handler)
+
     # ── Commands ───────────────────────────────────────────────────────────
-    app.add_handler(CommandHandler("start",      h.cmd_start))
-    app.add_handler(CommandHandler("help",       h.cmd_start))
-    app.add_handler(CommandHandler("add",        h.cmd_add))
-    app.add_handler(CommandHandler("remove",     h.cmd_remove))
-    app.add_handler(CommandHandler("list",       h.cmd_list))
-    app.add_handler(CommandHandler("clear",      h.cmd_clear))
-    app.add_handler(CommandHandler("run",        h.cmd_run))
-    app.add_handler(CommandHandler("status",     h.cmd_status))
-    app.add_handler(CommandHandler("cancel",     h.cmd_cancel))
-    app.add_handler(CommandHandler("cookies",    h.cmd_cookies))
+    app.add_handler(CommandHandler("start", h.cmd_start))
+    app.add_handler(CommandHandler("help", h.cmd_start))
+    app.add_handler(CommandHandler("add", h.cmd_add))
+    app.add_handler(CommandHandler("remove", h.cmd_remove))
+    app.add_handler(CommandHandler("list", h.cmd_list))
+    app.add_handler(CommandHandler("clear", h.cmd_clear))
+    app.add_handler(CommandHandler("run", h.cmd_run))
+    app.add_handler(CommandHandler("status", h.cmd_status))
+    app.add_handler(CommandHandler("cancel", h.cmd_cancel))
+    app.add_handler(CommandHandler("cookies", h.cmd_cookies))
     app.add_handler(CommandHandler("allowgroup", h.cmd_allowgroup))
-    app.add_handler(CommandHandler("denygroup",  h.cmd_denygroup))
-    app.add_handler(CommandHandler("groups",     h.cmd_groups))
+    app.add_handler(CommandHandler("denygroup", h.cmd_denygroup))
+    app.add_handler(CommandHandler("groups", h.cmd_groups))
 
     # ── Inline button callbacks ────────────────────────────────────────────
     app.add_handler(CallbackQueryHandler(h.handle_callback))
@@ -163,12 +200,13 @@ def main() -> None:
             size = cookie_path.stat().st_size
             status = f"✅ {size:,} bytes"
             if size < 2000:
-                status += " ⚠️  (too small — may cause 429)"
+                status += " ⚠️ (too small — may cause 429)"
         else:
             status = "❌ missing"
         logger.info("Cookie [%s]: %s", plat.name, status)
 
     app = _build_app(cfg)
+
     logger.info("Polling for updates…")
     app.run_polling(
         drop_pending_updates=True,
